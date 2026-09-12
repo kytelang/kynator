@@ -1,0 +1,119 @@
+// 195 -- the control-plane / data-plane split: kynatord advertises each workload's service endpoints to a discovery
+// file, service resolves ALL of them into its backend pool. Offline/deterministic: it drives the nativelet
+// with specs directly (manageProcesses off, no real spawn) and exercises the pure endpoint model + the
+// file round-trip + the proxy-pool consumption, so the two binaries' coupling is gated without sockets.
+import assert;
+import orch.spec;
+import orch.nativelet;
+import net.service;
+import net.proxy;
+import list;
+import string;
+import io.file;
+
+fn specWithService(name: string, bin: string, replicas: int, basePort: int): spec.Spec {
+    let s = spec.Spec(name, bin);
+    s.replicas = replicas;
+    s.basePort = basePort;
+    s.portFlag = "--port";
+    return s;
+}
+
+// ---- pure endpoint model (spec.serviceEndpoints) ----
+
+@test
+fn test_service_endpoints_per_replica(): void {
+    let s = specWithService("web", "/opt/web", 3, 9000);
+    let eps = spec.serviceEndpoints(s, "10.0.0.5");
+    assert.equalInt(eps.size(), 3);
+    assert.equalStr(eps.get(0) ?? "", "10.0.0.5:9000");
+    assert.equalStr(eps.get(1) ?? "", "10.0.0.5:9001");
+    assert.equalStr(eps.get(2) ?? "", "10.0.0.5:9002");
+}
+
+@test
+fn test_service_endpoints_probe_fallback(): void {
+    let s = spec.Spec("api", "/opt/api");   // no basePort
+    s.probePort = 8443;
+    let eps = spec.serviceEndpoints(s, "127.0.0.1");
+    assert.equalInt(eps.size(), 1);
+    assert.equalStr(eps.get(0) ?? "", "127.0.0.1:8443");
+}
+
+@test
+fn test_service_endpoints_none_when_unexposed(): void {
+    let s = spec.Spec("batch", "/opt/batch");   // no basePort, no probePort
+    assert.equalInt(spec.serviceEndpoints(s, "127.0.0.1").size(), 0);
+}
+
+// ---- nativelet publication (renderDiscovery) ----
+
+@test
+fn test_render_discovery_multi_workload(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;             // no real spawn; advertised endpoints are the desired topology
+    n.advertiseHost = "127.0.0.1";
+
+    let desired = list.List<spec.Spec>();
+    desired.push(specWithService("web", "/opt/web", 2, 9000));
+    desired.push(specWithService("api", "/opt/api", 1, 9100));
+    n.reconcileWith(desired);
+
+    let text = n.renderDiscovery();
+    // web has 2 replicas (9000, 9001), api has 1 (9100).
+    assert.isTrue(string.contains(text, "web=127.0.0.1:9000\n"));
+    assert.isTrue(string.contains(text, "web=127.0.0.1:9001\n"));
+    assert.isTrue(string.contains(text, "api=127.0.0.1:9100\n"));
+
+    // resolveAllFrom over a published file returns every replica of a service.
+    let path = "/tmp/kyte_orch_test_disc.txt";
+    n.discoveryFile = path;
+    n.publishDiscovery();
+    let webEps = service.resolveAllFrom(path, "web");
+    assert.equalInt(webEps.size(), 2);
+    let apiEps = service.resolveAllFrom(path, "api");
+    assert.equalInt(apiEps.size(), 1);
+    assert.equalStr(apiEps.get(0) ?? "", "127.0.0.1:9100");
+}
+
+@test
+fn test_discovery_reflects_removal(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;
+    let d1 = list.List<spec.Spec>();
+    d1.push(specWithService("web", "/opt/web", 1, 9000));
+    d1.push(specWithService("api", "/opt/api", 1, 9100));
+    n.reconcileWith(d1);
+    assert.isTrue(string.contains(n.renderDiscovery(), "api="));
+
+    // Next reconcile drops `api` -> it disappears from the advertised set.
+    let d2 = list.List<spec.Spec>();
+    d2.push(specWithService("web", "/opt/web", 1, 9000));
+    n.reconcileWith(d2);
+    let text = n.renderDiscovery();
+    assert.isTrue(string.contains(text, "web="));
+    assert.isFalse(string.contains(text, "api="));
+}
+
+// ---- service consumption: a discovery file with N endpoints -> an N-backend pool ----
+
+@test
+fn test_proxy_pool_from_discovery(): void {
+    let path = "/tmp/kyte_orch_test_disc2.txt";
+    file.File.writeText(path, "web=127.0.0.1:9000\nweb=127.0.0.1:9001\napi=127.0.0.1:9100\n");
+    let eps = service.resolveAllFrom(path, "web");
+    let pool = proxy.Pool();
+    let i = 0;
+    while (i < eps.size()) {
+        let hp = string.split(eps.get(i) ?? "", ":");
+        let host = hp.get(0) ?? "";
+        let port = string.parseI64(hp.get(1) ?? "0") as int;
+        pool.add(host, port);
+        i = i + 1;
+    }
+    assert.equalInt(pool.size(), 2);          // both web replicas, not api
+    // The pool now round-robins across the two discovered replicas.
+    assert.equalInt(pool.select("").port, 9000);
+    assert.equalInt(pool.select("").port, 9001);
+    assert.equalInt(pool.select("").port, 9000);
+}

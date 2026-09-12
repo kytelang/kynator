@@ -1,0 +1,37 @@
+// artifactd -- the artifact daemon of the orchestrator stack.
+//
+// A content-addressed blob origin for deploy binaries. CI uploads a native binary keyed by its sha256
+// (idempotent, verified), and each kynatord node pulls it by hash into a local cache before spawning a
+// replica (see orch/artifact.ky). This is the distribution point for the deploy flow; the desired-state
+// manifest (which references the artifact by hash) lives in the NovaDB config store, not here.
+//
+//   artifactd   # KYTE_ARTIFACT_ROOT (default ./artifacts-blobs), KYTE_ARTIFACT_TOKEN (deploy token,
+//               # empty = auth OFF, dev only), KYTE_PORT (default 8135)
+import web.app;
+import artifacts.blobstore;
+import artifacts.registry;
+import artifacts.service;
+import artifacts.cfgstore;
+import string;
+import env;
+
+fn main(): void {
+    let root = env.get("KYTE_ARTIFACT_ROOT");
+    if (string.eql(root, "")) { root = "./artifacts-store"; }
+    let token = env.get("KYTE_ARTIFACT_TOKEN");
+    let port = 8135;
+    let pe = env.get("KYTE_PORT");
+    if (!string.eql(pe, "")) { port = string.parseI64(pe) as int; }
+
+    // Structured root: content-addressed bytes under blobs/, the app/version namespace under apps/.
+    let authState = if (string.eql(token, "")) "OFF (dev)" else "on";
+    let store = blobstore.BlobStore(root + "/blobs");
+    let reg = registry.Registry(root + "/apps", store);
+    let app = service.buildArtifactService(store, reg, token);
+    // Host the orchestrator config store here too: the tiny control-plane KV (specs, leader lease,
+    // membership) with an atomic CAS, snapshotted to <root>/config.snap. This is what replaced NovaDB.
+    let cfg = cfgstore.DurableConfigStore(root + "/config.snap");
+    cfgstore.mountConfigStore(app, cfg);
+    console.log(`artifactd: artifact origin + config store on http://127.0.0.1:${port} root=${root} auth=${authState}`);
+    app.run(port);
+}

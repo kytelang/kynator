@@ -1,0 +1,154 @@
+// 199 -- O3 operability: automated rolling upgrade (drain/promote/upgrade/rejoin + rollback), cluster
+// membership (add/remove/list/quorum), and logical config backup/restore. All deterministic over the sync
+// LeaderLease + in-memory ConfigStore (mock clock), so they gate in CI; the live daemon runs the same
+// policy against the async store.
+import assert;
+import store.config;
+import orch.lease;
+import orch.rollout;
+import orch.membership;
+import orch.backup;
+import orch.health;
+import orch.nativelet;
+import list;
+import string;
+
+const KEY: string = "leases/leader";
+const TTL: long = 1000;
+
+fn defNode(): lease.LeaderLease { return lease.LeaderLease(config.ConfigStore(), "", KEY, TTL); }
+
+fn cluster(store: config.ConfigStore, n: int): list.List<lease.LeaderLease> {
+    let nodes = list.List<lease.LeaderLease>();
+    let i = 1;
+    while (i <= n) { nodes.push(lease.LeaderLease(store, `node${i}`, KEY, TTL)); i = i + 1; }
+    return nodes;
+}
+
+fn allTrue(n: int): list.List<bool> {
+    let l = list.List<bool>();
+    let i = 0;
+    while (i < n) { l.push(true); i = i + 1; }
+    return l;
+}
+
+// ---- rolling upgrade ----
+
+@test
+fn test_rolling_upgrade_keeps_a_leader_and_completes(): void {
+    let store = config.ConfigStore();
+    let nodes = cluster(store, 3);
+    let n0 = nodes.get(0) ?? defNode();
+    assert.isTrue(n0.tryAcquire(0));                 // node1 leads (epoch 1)
+    let startEpoch = n0.currentEpoch();
+
+    // stepMs < TTL so the active leader stays valid between nodes; release() makes a drained lease takeable.
+    let res = rollout.rollingUpgrade(nodes, allTrue(3), 100, 50);
+    assert.isTrue(res.ok);
+    assert.equalInt(res.upgraded, 3);
+    assert.isFalse(string.eql(res.leader, ""));      // a leader exists at the end (never lost)
+    // The leader was drained + a peer promoted at least once, so the epoch climbed.
+    assert.isTrue((nodes.get(0) ?? defNode()).currentEpoch() > startEpoch);
+    // Exactly one valid leader after the rollout settles.
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), 500), 1);
+}
+
+@test
+fn test_rolling_upgrade_rolls_back_on_failure(): void {
+    let store = config.ConfigStore();
+    let nodes = cluster(store, 3);
+    assert.isTrue((nodes.get(0) ?? defNode()).tryAcquire(0));
+
+    // Node at index 1 fails its upgrade -> rollback + stop after upgrading index 0.
+    let health = list.List<bool>();
+    health.push(true);
+    health.push(false);
+    health.push(true);
+    let res = rollout.rollingUpgrade(nodes, health, 100, 50);
+    assert.isFalse(res.ok);
+    assert.equalInt(res.upgraded, 1);                // stopped at the failing node
+    assert.isTrue(string.contains(res.message, "rolled back"));
+    // The cluster is still healthy: exactly one leader.
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), 500), 1);
+}
+
+// ---- membership ----
+
+@test
+fn test_membership_add_remove_list_quorum(): void {
+    let store = config.ConfigStore();
+    let _1 = membership.add(store, "node1", "10.0.0.1:7000");
+    let _2 = membership.add(store, "node2", "10.0.0.2:7000");
+    let _3 = membership.add(store, "node3", "10.0.0.3:7000");
+    assert.equalInt(membership.count(store), 3);
+    assert.equalInt(membership.quorum(store), 2);            // 3/2 + 1
+    assert.isTrue(membership.isMember(store, "node2"));
+    assert.equalStr(membership.address(store, "node2"), "10.0.0.2:7000");
+
+    let names = membership.members(store);
+    assert.equalInt(names.size(), 3);
+
+    assert.isTrue(membership.remove(store, "node2"));
+    assert.equalInt(membership.count(store), 2);
+    assert.isFalse(membership.isMember(store, "node2"));
+    assert.equalInt(membership.quorum(store), 2);            // 2/2 + 1
+}
+
+// ---- backup / restore ----
+
+@test
+fn test_backup_restore_round_trips_config(): void {
+    let src = config.ConfigStore();
+    let _1 = src.put("workloads/web", "{\"name\":\"web\",\"replicas\":3}");
+    let _2 = src.put("workloads/api", "{\"name\":\"api\",\"replicas\":1}");
+    let _3 = src.put("leases/leader", "node1|4|9999");
+    let data = backup.dump(src, "");
+
+    // Restore into a FRESH store and confirm every entry came back.
+    let dst = config.ConfigStore();
+    let applied = backup.restore(dst, data);
+    assert.equalInt(applied, 3);
+    let web = dst.get("workloads/web") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(web.value, "{\"name\":\"web\",\"replicas\":3}");
+    let lrow = dst.get("leases/leader") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(lrow.value, "node1|4|9999");
+}
+
+@test
+fn test_backup_prefix_scopes_the_dump(): void {
+    let src = config.ConfigStore();
+    let _1 = src.put("workloads/web", "a");
+    let _2 = src.put("leases/leader", "b");
+    let only = backup.dump(src, "workloads/");
+    assert.isTrue(string.contains(only, "workloads/web"));
+    assert.isFalse(string.contains(only, "leases/leader"));
+}
+
+// Output escaping: a config value containing a TAB or NEWLINE must round-trip through the line-oriented
+// backup dump/restore (previously it corrupted the format), and a workload name with a quote must be escaped
+// in the Prometheus /metrics label (previously it broke the {workload="..."} exposition).
+@test
+fn test_backup_round_trips_tab_and_newline_values(): void {
+    let src = config.ConfigStore();
+    let nasty = "line1\nline2\tcol\\end";   // embedded newline, tab, backslash
+    let _1 = src.put("k/weird", nasty);
+    let _2 = src.put("k/plain", "ok");
+    let data = backup.dump(src, "");
+    let dst = config.ConfigStore();
+    let applied = backup.restore(dst, data);
+    assert.equalInt(applied, 2);
+    let got = dst.get("k/weird") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(got.value, nasty);     // exact round-trip, structure intact
+    let plain = dst.get("k/plain") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(plain.value, "ok");
+}
+
+@test
+fn test_metrics_label_escapes_quotes(): void {
+    let r = health.HealthReport("standalone", 0, "", true, 1, 1, 0, 0, 0);
+    let statuses = list.List<nativelet.WorkloadStatus>();
+    statuses.push(nativelet.WorkloadStatus("we\"ird", 1, 1, 0));
+    let out = health.renderMetrics(r, statuses);
+    // The quote in the name is escaped (\"), so the label is not broken.
+    assert.isTrue(string.contains(out, "workload=\"we\\\"ird\""));
+}

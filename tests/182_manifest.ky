@@ -1,0 +1,96 @@
+// 182 - the declarative YAML app manifest (orch/manifest). Pins the @serializable + YamlSource binding
+// of a full manifest (nested structs, an int/float/bool mix, and List<string> for args/routes), the
+// defaults an omitted field falls back to, and validateManifest's rejection rules. Offline; no processes.
+import assert;
+import string;
+import orch.manifest;
+
+fn sampleYaml(): string {
+    return "apiVersion: kyte/v1\n" +
+           "kind: App\n" +
+           "metadata:\n" +
+           "  name: shop\n" +
+           "workload:\n" +
+           "  binary: ./bin/webapp\n" +
+           "  args:\n" +
+           "    - --config\n" +
+           "    - prod\n" +
+           "  restartPolicy: always\n" +
+           "replicas:\n" +
+           "  min: 2\n" +
+           "  max: 6\n" +
+           "autoscale:\n" +
+           "  enabled: true\n" +
+           "  metric: inflight\n" +
+           "  target: 8\n" +
+           "  intervalMs: 2000\n" +
+           "lb:\n" +
+           "  strategy: leastconn\n" +
+           "  handoff: true\n" +
+           "health:\n" +
+           "  path: /healthz\n" +
+           "  rise: 2\n" +
+           "  fall: 3\n" +
+           "network:\n" +
+           "  expose: gateway-only\n" +
+           "routes:\n" +
+           "  - /api/products\n" +
+           "  - /api/orders\n" +
+           "resources:\n" +
+           "  cpuMilli: 500\n" +
+           "  memMaxBytes: 268435456\n" +
+           "  pidsMax: 128\n";
+}
+
+@test
+fn test_manifest_binds_all_sections(): void {
+    let m = manifest.parseManifest(sampleYaml());
+    assert.equalStr(m.apiVersion, "kyte/v1");
+    assert.equalStr(m.metadata.name, "shop");
+    assert.equalStr(m.workload.binary, "./bin/webapp");
+    assert.equalInt(m.workload.args.size(), 2);
+    assert.equalStr(m.workload.args.at(0) ?? "", "--config");
+    assert.equalStr(m.workload.restartPolicy, "always");
+    assert.equalInt(m.replicas.min, 2);
+    assert.equalInt(m.replicas.max, 6);
+    assert.isTrue(m.autoscale.enabled);
+    assert.equalStr(m.autoscale.metric, "inflight");
+    assert.isTrue(m.autoscale.target > 7.9 && m.autoscale.target < 8.1);
+    assert.equalInt(m.autoscale.intervalMs, 2000);
+    assert.equalStr(m.lb.strategy, "leastconn");
+    assert.isTrue(m.lb.handoff);
+    assert.equalInt(m.health.rise, 2);
+    assert.equalStr(m.network.expose, "gateway-only");
+    assert.equalInt(m.routes.size(), 2);
+    assert.equalStr(m.routes.at(1) ?? "", "/api/orders");
+    assert.equalInt(m.resources.cpuMilli, 500);
+    assert.isTrue(m.resources.memMaxBytes == (268435456 as long));
+}
+
+@test
+fn test_manifest_defaults_fill_absent_fields(): void {
+    // A minimal manifest: only the two required fields; everything else takes its default.
+    let m = manifest.parseManifest("metadata:\n  name: mini\nworkload:\n  binary: /bin/app\n");
+    assert.equalStr(m.apiVersion, "kyte/v1");     // default
+    assert.equalInt(m.replicas.min, 1);           // default band = 1..1
+    assert.equalInt(m.replicas.max, 1);
+    assert.isTrue(!m.autoscale.enabled);          // autoscaling off by default
+    assert.equalStr(m.lb.strategy, "roundrobin"); // default strategy
+    assert.isTrue(m.lb.handoff);                 // handoff is the default data path now
+    assert.equalStr(m.health.path, "/healthz");   // default probe path
+    assert.equalStr(m.network.expose, "gateway-only");
+    assert.equalInt(m.routes.size(), 0);
+}
+
+@test
+fn test_manifest_validation(): void {
+    assert.equalStr(manifest.validateManifest(manifest.parseManifest(sampleYaml())), "");  // valid
+    // required fields
+    assert.isTrue(!string.eql(manifest.validateManifest(manifest.parseManifest("workload:\n  binary: /b\n")), ""));
+    // inverted replica band
+    let bad = manifest.parseManifest("metadata:\n  name: x\nworkload:\n  binary: /b\nreplicas:\n  min: 5\n  max: 2\n");
+    assert.equalStr(manifest.validateManifest(bad), "replicas.max must be >= replicas.min");
+    // unknown lb strategy
+    let bad2 = manifest.parseManifest("metadata:\n  name: x\nworkload:\n  binary: /b\nlb:\n  strategy: magic\n");
+    assert.isTrue(string.contains(manifest.validateManifest(bad2), "lb.strategy"));
+}

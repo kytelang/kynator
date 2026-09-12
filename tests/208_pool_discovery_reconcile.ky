@@ -1,0 +1,110 @@
+// 208 -- live service-discovery reconcile at the Pool level (ROADMAP-1.0 Tier 1 item 4). The data plane
+// re-reads kynatord's published endpoint set each tick and reshapes its backend pool with Pool.setEndpoints:
+// a scaled-up replica is added, a departed one removed, and a replica that persists keeps its Backend
+// object (health + in-flight conn state) rather than flapping. These are the pure pool-membership
+// invariants; the full live curl-through-the-front-port proof runs on the VM.
+import assert;
+import net.proxy;
+import orch.nativelet;
+import orch.spec;
+import orch.supervisor;
+import list;
+import string;
+
+fn eps(a: string, b: string, c: string): list.List<string> {
+    let l = list.List<string>();
+    if (!string.eql(a, "")) { l.push(a); }
+    if (!string.eql(b, "")) { l.push(b); }
+    if (!string.eql(c, "")) { l.push(c); }
+    return l;
+}
+
+@test
+fn set_endpoints_from_empty_adds_all(): void {
+    let p = proxy.Pool();
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", ""));
+    assert.equalInt(p.size(), 2);
+    assert.equalInt(changed, 2);   // two added
+}
+
+@test
+fn scale_up_adds_only_the_new_one(): void {
+    let p = proxy.Pool();
+    let _ = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", ""));
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", "127.0.0.1:18492"));
+    assert.equalInt(p.size(), 3);
+    assert.equalInt(changed, 1);   // one added, none removed
+}
+
+@test
+fn scale_down_removes_departed(): void {
+    let p = proxy.Pool();
+    let _ = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", "127.0.0.1:18492"));
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "", ""));
+    assert.equalInt(p.size(), 1);
+    assert.equalInt(changed, 2);   // two removed
+    let b = p.select("");
+    assert.isTrue(string.eql(b.host, "127.0.0.1"));
+    assert.equalInt(b.port, 18490);
+}
+
+@test
+fn persisting_backend_keeps_its_object_and_conn_state(): void {
+    let p = proxy.Pool();
+    let _ = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", ""));
+    // Simulate an in-flight connection on :18490, then reconcile with the same live set.
+    let before = p.backendFor("127.0.0.1", 18490);
+    before.acquireConn();
+    assert.equalInt(before.activeConns(), 1);
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18491", ""));
+    assert.equalInt(changed, 0);                      // no membership change
+    // The Backend object for :18490 is preserved across the rebuild, so its active-conn count survives
+    // rather than resetting to zero (a rebuild that dropped the object would lose in-flight accounting).
+    let after = p.backendFor("127.0.0.1", 18490);
+    assert.equalInt(after.activeConns(), 1);
+}
+
+@test
+fn duplicate_endpoints_are_deduplicated(): void {
+    let p = proxy.Pool();
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "127.0.0.1:18490", "127.0.0.1:18491"));
+    assert.equalInt(p.size(), 2);
+    assert.equalInt(changed, 2);
+}
+
+@test
+fn empty_and_malformed_endpoints_are_skipped(): void {
+    let p = proxy.Pool();
+    let changed = p.setEndpoints(eps("127.0.0.1:18490", "garbage", ""));
+    assert.equalInt(p.size(), 1);
+    assert.equalInt(changed, 1);
+}
+
+// A pure replica-count change reconciles by adding/removing replicas in place (ensureReplicas), NOT by a
+// rolling binary bounce. This is the control-plane half of the front-door story: scale the desired count
+// and the running set (and thus the published discovery endpoints) follows. Simulated supervisors so the
+// count is virtual and deterministic.
+@test
+fn scale_change_adjusts_running_replicas(): void {
+    let n = nativelet.Nativelet("/tmp/unused-208");
+    n.simulated = true;
+    let d1 = list.List<spec.Spec>();
+    d1.push(spec.parseSpec("{\"name\":\"frontsvc\",\"binaryPath\":\"/svc\",\"replicas\":2}"));
+    n.reconcileWith(d1);
+    assert.equalInt(n.totalRunning(), 2);
+    assert.equalInt(n.desiredReplicas("frontsvc"), 2);
+
+    // scale UP to 3: one replica added, none bounced
+    let d2 = list.List<spec.Spec>();
+    d2.push(spec.parseSpec("{\"name\":\"frontsvc\",\"binaryPath\":\"/svc\",\"replicas\":3}"));
+    n.reconcileWith(d2);
+    assert.equalInt(n.totalRunning(), 3);
+    assert.equalInt(n.desiredReplicas("frontsvc"), 3);
+
+    // scale DOWN to 1: two replicas shed immediately (not deferred behind a roll)
+    let d3 = list.List<spec.Spec>();
+    d3.push(spec.parseSpec("{\"name\":\"frontsvc\",\"binaryPath\":\"/svc\",\"replicas\":1}"));
+    n.reconcileWith(d3);
+    assert.equalInt(n.totalRunning(), 1);
+    assert.equalInt(n.desiredReplicas("frontsvc"), 1);
+}

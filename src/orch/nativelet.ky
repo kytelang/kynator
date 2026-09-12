@@ -1,0 +1,785 @@
+// orch/nativelet.ky - the node agent (I2 native orchestrator, native-k8s MVP).
+//
+// Watches a manifest directory of JSON Specs and RECONCILES desired state against actual: it starts a
+// Supervisor for each new manifest, restarts a workload whose spec changed, polls running ones to
+// restart crashed replicas, and stops workloads whose manifest was deleted. One async coroutine drives
+// the whole loop (non-blocking supervisors) - no thread per workload, unlike the Zig PoC.
+//
+//   let n = nativelet.Nativelet("manifests");
+//   let _ = nativelet.run(n, 2000);        // reconcile every 2s, forever
+
+import orch.spec;
+import orch.supervisor;
+import orch.manifest;
+import orch.autoscaler;
+import orch.artifact;
+import artifacts.blobstore;
+import io.dir;
+import io.file;
+import bytes;
+import list;
+import string;
+import net.aio;
+import store.config;
+import process;
+import datetime;
+
+// How many consecutive failed HTTP probes drain a workload's patience before it is restarted.
+const PROBE_FAIL_LIMIT = 3;
+
+// T1-1: reconcile ticks to wait after replacing one replica before replacing the next, so the just-started
+// replica has time to bind and be raised into the load balancer's rotation (the data-plane readiness gate)
+// before the workload loses another. With reconcileMs ~1s and health rise ~1-2 probes, a few ticks is ample.
+const ROLL_GRACE_TICKS = 4;
+
+// T1-4 torn-free write: write to a sibling temp file, then rename over the target. rename(2) is atomic
+// within a filesystem (temp and target share the directory, hence the filesystem), so a concurrent reader
+// on the data plane sees either the old discovery file or the complete new one, never a half-written file
+// that would momentarily drop backends. One writer per file (the single kynatord reconcile loop), so a fixed
+// ".tmp" suffix cannot collide.
+fn atomicWriteText(path: string, content: string): void {
+    let tmp = path + ".tmp";
+    file.File.writeText(tmp, content);
+    let _ = dir.Dir.rename(tmp, path);
+}
+
+// Whether a store value is a raw JSON Spec (first non-space char is '{') rather than a YAML manifest.
+// Used by reconcileFromEntries to sniff the workload-descriptor form (a store value has no filename to
+// key off, unlike scan()'s ".json"/".yaml" split).
+fn startsWithJson(s: string): bool {
+    let i = 0;
+    let n = string.len(s);
+    while (i < n) {
+        let c = s[i];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { return c == 123; }   // 123 = '{'
+        i = i + 1;
+    }
+    return false;
+}
+
+// One scanned manifest file: its filename-stem key, the parsed spec, and whether the parse succeeded.
+// valid=false means the file exists but couldn't be read/parsed THIS tick (keep, don't delete).
+pub struct ScanEntry {
+    pub key: string,
+    pub spec: spec.Spec,
+    pub valid: bool,
+    init(key: string, sp: spec.Spec, valid: bool) {
+        self.key = key;
+        self.spec = sp;
+        self.valid = valid;
+    }
+}
+
+// A class (reference) so the reconcile loop can mutate its roll state in place across ticks.
+pub class Job {
+    pub name: string,
+    pub sup: supervisor.Supervisor,
+    pub desired: spec.Spec,     // the spec this supervisor was started from (for change detection)
+    pub probeFails: int,        // consecutive failed heal probes (→ restart at desired.probeFall)
+    // T1-1 rolling-update state. When a spec change is detected, `rolling` is set and the reconcile loop
+    // replaces one replica per grace window (rollOne) until `rollLeft` reaches 0, keeping the others up.
+    pub rolling: bool,
+    pub rollLeft: int,          // replicas still to replace this roll
+    pub rollGrace: int,         // ticks to wait for the just-replaced replica to become ready
+    // Autoscaling (set from the Spec at newJob when spec.autoscale). `scaler` drives sup.spec.replicas
+    // within [autoMin, autoMax] each reconcile interval toward the metric target. `simMetric` is a test
+    // hook: when the Nativelet is `simulated`, autoscaleTick feeds this value to the scaler instead of
+    // sampling a live cgroup, so scaling is deterministically unit-testable without real processes.
+    pub autoOn: bool,
+    pub scaler: autoscaler.WorkloadScaler,
+    pub simMetric: double,
+    init(name: string, sup: supervisor.Supervisor, desired: spec.Spec) {
+        self.name = name;
+        self.sup = sup;
+        self.desired = desired;
+        self.probeFails = 0;
+        self.rolling = false;
+        self.rollLeft = 0;
+        self.rollGrace = 0;
+        self.autoOn = false;
+        self.scaler = autoscaler.WorkloadScaler(sup, 1, 1, 0.0);
+        self.simMetric = 0.0;
+    }
+}
+
+// One workload's observability snapshot (P4 metrics): desired vs running replica count + cumulative
+// restarts. `running < desired` is the "under-provisioned" signal a scrape/alert keys off; restarts is the
+// crash-loop signal. Produced by Nativelet.status(); pure data, so it is trivially serialized to a metrics
+// endpoint or a structured log line.
+pub struct WorkloadStatus {
+    pub name: string,
+    pub desired: int,
+    pub running: int,
+    pub restarts: int,
+    pub probeFails: int,   // consecutive failed heal probes right now (0 = healthy)
+    pub rolling: bool,     // true while a rolling upgrade of this workload is in progress
+    init(name: string, desired: int, running: int, restarts: int) {
+        self.name = name;
+        self.desired = desired;
+        self.running = running;
+        self.restarts = restarts;
+        self.probeFails = 0;
+        self.rolling = false;
+    }
+}
+
+pub struct Nativelet {
+    pub manifestsDir: string,
+    // Jobs keyed by name via linear scan (workloads are few; a Map<string,Job> mono-miscompiles a
+    // cross-module struct value, and a list keeps ordering deterministic for reconcile anyway).
+    pub jobs: list.List<Job>,
+    // Propagated to every Supervisor: false in tests so reconcile logic runs without spawning binaries.
+    pub manageProcesses: bool,
+    // Control-plane / data-plane split: when discoveryFile != "", each reconcile tick publishes every workload's
+    // advertised service endpoints (on advertiseHost) to that file, one `name=host:port` line per replica,
+    // for service to resolve (net.service.resolveAllFrom). "" disables publication.
+    pub discoveryFile: string,
+    pub advertiseHost: string,
+    // O6: propagated to every Supervisor -- true = deterministic VIRTUAL replicas (crash-loop / rescale
+    // lifecycle testable in-process without spawning binaries). Independent of manageProcesses.
+    pub simulated: bool,
+    // Path to the `service` (gateway) binary. When set, each handoff workload gets a companion service
+    // process launched + supervised alongside its app replicas (see expandServices). "" disables it (the
+    // service is then deployed out-of-band).
+    pub servicePath: string,
+    // Test hook for the pre-rollout migrate gate: when simulated (or manageProcesses is false) runMigrate
+    // does NOT spawn the app binary and returns this injected exit code instead (0 = migrate succeeded).
+    // Offline gate tests set it to drive the success path (roll proceeds) and the failure path (roll aborts,
+    // old replicas keep serving) deterministically, without a real database or a real one-shot process.
+    pub simMigrateExit: int,
+    // Content-addressed artifact delivery. When a workload's spec carries `artifact: sha256:<hex>`, scan()
+    // resolves it to a local blob under `blobRoot` (the per-node cache dir), pulling it by hash from
+    // `artifactOrigin` (bearer `artifactToken`) if not already cached, and rewrites the spec's binaryPath
+    // to the cached file before the supervisor spawns it. blobRoot == "" disables resolution (a spec that
+    // then still declares an artifact is treated as unresolvable and its workload is not started).
+    pub blobRoot: string,
+    pub artifactOrigin: string,
+    pub artifactToken: string,
+    init(manifestsDir: string) {
+        self.manifestsDir = manifestsDir;
+        self.jobs = list.List<Job>();
+        self.manageProcesses = true;
+        self.discoveryFile = "";
+        self.advertiseHost = "127.0.0.1";
+        self.simulated = false;
+        self.servicePath = "";
+        self.simMigrateExit = 0;
+        self.blobRoot = "";
+        self.artifactOrigin = "";
+        self.artifactToken = "";
+    }
+
+    // Resolve a CONTENT-ADDRESSED artifact (precondition: artifactId != "") to a runnable local path,
+    // pulling the blob by hash from the origin if it is not already cached. Returns the local path (for a
+    // tarball, the workdir), or "" when it cannot be resolved this tick (no cache configured, or the
+    // pull/verify/extract failed) so scan() keeps the last-good workload serving. scan() calls this ONLY
+    // for artifact-bearing specs and applies the result to its own local sp. Takes plain strings, not the
+    // Spec: a container-owning value struct crashes when passed as a plain fn arg. NOTE: this method must
+    // never `return` one of its own string parameters directly (a method returning a param string hits an
+    // ARC double-free); it returns only "" or the value produced by resolveOrPull.
+    pub fn resolveArtifactPath(self: Nativelet, artifactId: string, binaryPath: string,
+                               artifactKind: string, workdir: string): string {
+        if (string.eql(self.blobRoot, "")) { return ""; }    // artifact declared but no cache configured
+        let cache = blobstore.BlobStore(self.blobRoot);
+        return artifact.resolveOrPull(artifactId, binaryPath, artifactKind, workdir,
+                                      self.artifactOrigin, self.artifactToken, cache);
+    }
+
+    // Run the workload's pre-rollout migration step once and return its process exit code (0 = success, a
+    // non-zero migrate failure, or -1 on a spawn error / timeout). This is the GATE the reconcile loop holds
+    // the rollout on. It runs the workload's OWN binary with spec.migrateArgs (conventionally ["--migrate"]),
+    // so the same artifact that will serve traffic applies its own schema first - no drift.
+    //
+    // It runs to completion synchronously (mirroring supervisor.stopProc's bounded busy-poll against a
+    // wall-clock deadline): the reconcile tick blocks for the migration's duration. That is acceptable for a
+    // single-kynatord control plane and only during a deploy; the already-running replicas keep serving over
+    // the OS regardless. A migrateTimeoutMs of 0 waits indefinitely. In simulated/unmanaged mode it returns
+    // the injected simMigrateExit so the gate is offline-testable with no process or database.
+    fn runMigrate(self: Nativelet, sp: spec.Spec): int {
+        if (self.simulated || !self.manageProcesses) { return self.simMigrateExit; }
+        let args = list.List<string>();
+        let i = 0;
+        while (i < sp.migrateArgs.size()) { args.push(sp.migrateArgs.get(i) ?? ""); i = i + 1; }
+        let p = process.Process.spawn(sp.binaryPath, args);
+        // No timeout: block on wait() (no CPU spin). This is the common case -- migrations are expected to
+        // terminate, and the reconcile tick blocks until they do (see the note above).
+        if (sp.migrateTimeoutMs <= 0) {
+            let code = p.wait();
+            p.close();
+            return code;
+        }
+        // With a timeout, poll tryWait against a wall-clock deadline (mirrors supervisor.stopProc) so an
+        // overrunning migration is SIGKILLed and reported as a failure rather than hanging the loop.
+        let startNs = datetime.nowNs();
+        let timeoutNs: long = (sp.migrateTimeoutMs as long) * 1000000;
+        while (true) {
+            let st = p.tryWait();
+            if (st != -2) { p.close(); return st; }                        // exited with code st
+            if (datetime.nowNs() - startNs >= timeoutNs) {
+                let _ = p.forceKill();
+                let _ = p.wait();                                          // reap the killed child
+                p.close();
+                return -1;                                                 // timed out
+            }
+        }
+        return -1;
+    }
+
+    // Render the service-discovery file contents from the current jobs: one `name=host:port` line per
+    // advertised replica endpoint, workloads in reconcile order. Pure (no I/O), so it is unit-testable.
+    pub fn renderDiscovery(self: Nativelet): string {
+        let out = "";
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            let eps = job.sup.advertisedEndpoints(self.advertiseHost);
+            let k = 0;
+            while (k < eps.size()) {
+                out = out + job.name + "=" + (eps.get(k) ?? "") + "\n";
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        return out;
+    }
+
+    // Write the discovery file TORN-FREE (T1-4) when publication is enabled. Called each reconcile tick by
+    // run(); a workload added/removed/rescaled shows up on the next tick, and service's active health
+    // checks prune any advertised endpoint that is not actually serving yet.
+    pub fn publishDiscovery(self: Nativelet): void {
+        if (string.eql(self.discoveryFile, "")) { return; }
+        atomicWriteText(self.discoveryFile, self.renderDiscovery());
+    }
+
+    pub fn findJobIdx(self: Nativelet, name: string): int {   // index or -1
+        let i = 0;
+        while (i < self.jobs.size()) {
+            if (string.eql((self.jobs.get(i) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).name, name)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Scan the watch dir: one ScanEntry per manifest file, KEYED BY FILENAME STEM (`web.yaml` → `web`).
+    // A `*.yaml`/`*.yml` file is the declarative Manifest schema (parsed via manifest.parseManifest,
+    // validated by validateManifest, lowered with toSpec); a `*.json` file is a legacy raw Spec (still
+    // supported). Presence comes from the file existing, NOT from a successful parse - a transient unreadable or
+    // half-written file (e.g. a read interrupted by SIGCHLD when a child dies) yields a ScanEntry with
+    // valid=false, so reconcile KEEPS the running workload instead of tearing it down. Missing dir →
+    // empty list (reconcile then stops everything - an explicit "no desired state").
+    pub fn scan(self: Nativelet): list.List<ScanEntry> {
+        let out = list.List<ScanEntry>();
+        if (!dir.Dir.exists(self.manifestsDir)) { return out; }
+        let d = dir.Dir.open(self.manifestsDir);
+        let names = d.entries();
+        d.close();
+        let i = 0;
+        while (i < names.size()) {
+            let nm = names.get(i) ?? "";
+            // YAML manifest (the declarative schema): <name>.yaml / .yml -> ScanEntry -> Spec via toSpec.
+            let isYaml = string.endsWith(nm, ".yaml") || string.endsWith(nm, ".yml");
+            if (isYaml) {
+                let cut = if (string.endsWith(nm, ".yaml")) 5 else 4;
+                let key = string.slice(nm, 0, string.len(nm) - cut);
+                let text = file.File.readText(self.manifestsDir + "/" + nm);
+                if (string.eql(text, "")) {
+                    out.push(ScanEntry(key, spec.Spec("", ""), false)); // present but unreadable this tick
+                } else {
+                    let mani = manifest.parseManifest(text);
+                    // Parse-then-VALIDATE (P4 rollout safety): validate the manifest, then lower to a Spec.
+                    let ok = string.eql(manifest.validateManifest(mani), "");
+                    let sp = manifest.toSpec(mani);
+                    // For a content-addressed workload, resolve the artifact to a local blob (pull by hash
+                    // if needed) and rewrite binaryPath/workdir before it is started; a resolution failure
+                    // keeps the last-good replicas serving (entry marked not-ready), tearing nothing down.
+                    // Only called when an artifact is declared (a local-path workload is used as-is).
+                    let rok = true;
+                    if (!string.eql(sp.artifact, "")) {
+                        let rp = self.resolveArtifactPath(sp.artifact, sp.binaryPath, sp.artifactKind, sp.workdir);
+                        if (string.eql(rp, "")) { rok = false; }
+                        else if (string.eql(sp.artifactKind, "tarball")) { sp.workdir = rp; }
+                        else { sp.binaryPath = rp; }
+                    }
+                    out.push(ScanEntry(key, sp, ok && rok));
+                }
+            } else if (string.endsWith(nm, ".json")) {
+                // Legacy JSON spec (still supported).
+                let key = string.slice(nm, 0, string.len(nm) - 5);   // strip ".json"
+                let text = file.File.readText(self.manifestsDir + "/" + nm);
+                if (string.eql(text, "")) {
+                    out.push(ScanEntry(key, spec.Spec("", ""), false)); // present but unreadable this tick
+                } else {
+                    let sp = spec.parseSpec(text);
+                    // Resolve the artifact FIRST (it rewrites binaryPath), then validate: a content-addressed
+                    // spec may carry an empty binaryPath until its blob is resolved into a local path.
+                    let rok = true;
+                    if (!string.eql(sp.artifact, "")) {
+                        let rp = self.resolveArtifactPath(sp.artifact, sp.binaryPath, sp.artifactKind, sp.workdir);
+                        if (string.eql(rp, "")) { rok = false; }
+                        else if (string.eql(sp.artifactKind, "tarball")) { sp.workdir = rp; }
+                        else { sp.binaryPath = rp; }
+                    }
+                    let valid = rok && string.eql(spec.validateSpec(sp), "");
+                    out.push(ScanEntry(key, sp, valid));
+                }
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn newJob(self: Nativelet, key: string, sp: spec.Spec): void {
+        let sup = supervisor.Supervisor(sp);
+        sup.manageProcesses = self.manageProcesses;
+        sup.simulated = self.simulated;
+        sup.start();
+        let job = Job(key, sup, sp);
+        if (sp.autoscale) {
+            job.autoOn = true;
+            job.scaler = autoscaler.WorkloadScaler(sup, sp.autoMin, sp.autoMax, sp.autoTarget);
+        }
+        self.jobs.push(job);
+    }
+
+    // Drive one autoscaling control step for every autoscale-enabled workload: sample its metric and let
+    // the WorkloadScaler move sup.spec.replicas within [autoMin, autoMax] toward the target (ensureReplicas
+    // then spawns/trims). `dt` is the reconcile interval in seconds. Runs AFTER reconcile+heal each tick, so
+    // the scaler's replica count is the authority for an autoscale workload (reconcile's poll() only tops it
+    // back up after a crash; the pure-scale branch never fires because the manifest replica count is fixed).
+    //   - metric "cpu": tickCpu samples the workload cgroup (Linux); no cgroup -> holds (e.g. unprivileged).
+    //   - metric "inflight": the live count lives in the gateway process, not here, so it is held in the
+    //     standalone daemon (gateway-gated; a future gateway->nativelet metric channel would feed it).
+    //   - when the Nativelet is `simulated` (tests), the per-job simMetric is fed directly, so scaling is
+    //     deterministic without a live cgroup or gateway.
+    pub fn autoscaleTick(self: Nativelet, dt: double): void {
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            if (job.autoOn) {
+                if (self.simulated) {
+                    let _ = job.scaler.tick(job.simMetric, dt);
+                } else if (string.eql(job.desired.autoMetric, "cpu")) {
+                    let _ = job.scaler.tickCpu(dt);
+                }
+            }
+            j = j + 1;
+        }
+    }
+
+    // One reconcile pass: converge running supervisors toward the manifests on disk.
+    pub fn reconcile(self: Nativelet): void {
+        self.reconcileScan(self.scan());
+    }
+
+    // Adapter kept for in-memory tests: treat each Spec as a valid manifest keyed by its own name.
+    pub fn reconcileWith(self: Nativelet, desired: list.List<spec.Spec>): void {
+        let ms = list.List<ScanEntry>();
+        let i = 0;
+        while (i < desired.size()) {
+            let sp = desired.get(i) ?? spec.Spec("", "");
+            ms.push(ScanEntry(sp.name, sp, true));
+            i = i + 1;
+        }
+        self.reconcileScan(ms);
+    }
+
+    // STORE-DRIVEN reconcile (config-store P1): converge toward desired state read from the config store
+    // instead of the manifest directory. `entries` are the store rows under `prefix` (e.g. the result of
+    // ConfigStore.list("workloads/") or `await SqlConfigStore.list("workloads/")`); each entry's key is
+    // "<prefix><name>" and its value is a workload descriptor. The daemon does the (possibly async) fetch
+    // and passes the entries here, so this stays sync + offline-testable and works with either store. The
+    // manifest dir becomes an optional bootstrap importer (load files into the store once), no longer the
+    // source of truth. An empty value is treated like an unreadable manifest: keep a running workload.
+    //
+    // A store value is one of two forms, sniffed by its first non-space character (mirroring scan()'s
+    // file-extension split, since a store value has no filename):
+    //   - a declarative YAML Manifest (the default the web control plane / kynatorctl write) -- parsed via
+    //     manifest.parseManifest, validated, and lowered to a Spec by manifest.toSpec; this is the primary
+    //     form, keeping the manifest the single source of truth on the store path too, not only on disk;
+    //   - a raw JSON Spec starting with '{' (the legacy store form, still honoured for older stores).
+    pub fn reconcileFromEntries(self: Nativelet, entries: list.List<config.ConfigEntry>, prefix: string): void {
+        let ms = list.List<ScanEntry>();
+        let i = 0;
+        while (i < entries.size()) {
+            let e = entries.get(i) ?? config.ConfigEntry("", "", 0);
+            let key = if (string.startsWith(e.key, prefix))
+                string.slice(e.key, string.len(prefix), string.len(e.key))
+            else
+                e.key;
+            if (string.eql(e.value, "")) {
+                ms.push(ScanEntry(key, spec.Spec("", ""), false)); // present but empty → keep running
+            } else if (startsWithJson(e.value)) {
+                let sp = spec.parseSpec(e.value);
+                // Parse-then-VALIDATE (P4 rollout safety): a spec that parses but is semantically bad (empty
+                // binaryPath, unknown restartPolicy, bad isolation level, ...) is treated like an unreadable
+                // manifest -- reconcileScan then keeps the last-good workload running instead of replacing a
+                // healthy one with a broken spec. A brand-new workload with a bad spec is simply not started.
+                ms.push(ScanEntry(key, sp, string.eql(spec.validateSpec(sp), "")));
+            } else {
+                // YAML manifest form: same parse-then-validate rollout-safety contract, via the manifest
+                // schema (an invalid manifest -> valid=false -> reconcileScan keeps the last-good workload).
+                let mani = manifest.parseManifest(e.value);
+                let ok = string.eql(manifest.validateManifest(mani), "");
+                ms.push(ScanEntry(key, manifest.toSpec(mani), ok));
+            }
+            i = i + 1;
+        }
+        self.reconcileScan(ms);
+    }
+
+    // The reconcile DIFF over scanned manifests: start new, replace changed, poll unchanged, keep the
+    // ones that failed to read this tick, and stop only workloads whose FILE is genuinely gone.
+    // Expand the desired set with a companion SERVICE (gateway) workload for every handoff app: `web`
+    // (handoff) also yields `web-svc` running the service binary on the same rendezvous. So the service
+    // is started, supervised, restarted, and torn down by the SAME reconcile machinery as the apps - no
+    // special-case lifecycle. A no-op when servicePath is "" or the workload is not handoff, and never
+    // expands an already-derived "-svc" entry (no recursion).
+    fn expandServices(self: Nativelet, manifests: list.List<ScanEntry>): list.List<ScanEntry> {
+        if (string.eql(self.servicePath, "")) { return manifests; }
+        let out = list.List<ScanEntry>();
+        let i = 0;
+        while (i < manifests.size()) {
+            let m = manifests.get(i) ?? ScanEntry("", spec.Spec("", ""), false);
+            out.push(m);
+            if (m.valid && m.spec.handoff && !string.endsWith(m.key, "-svc")) {
+                let svc = spec.serviceSpecFrom(m.spec, self.servicePath);
+                out.push(ScanEntry(m.key + "-svc", svc, true));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    pub fn reconcileScan(self: Nativelet, manifestsIn: list.List<ScanEntry>): void {
+        let manifests = self.expandServices(manifestsIn);
+        let presentKeys = list.List<string>();
+
+        let i = 0;
+        while (i < manifests.size()) {
+            let m = manifests.get(i) ?? ScanEntry("", spec.Spec("", ""), false);
+            presentKeys.push(m.key);                 // file exists → workload is "present" regardless of parse
+            let at = self.findJobIdx(m.key);
+            if (!m.valid) {
+                // Unreadable/half-written this tick: keep an existing workload running (just poll it);
+                // can't start a brand-new one without a spec, so skip.
+                if (at >= 0) {
+                    (self.jobs.get(at) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.poll();
+                }
+            } else if (at >= 0) {
+                let job = self.jobs.get(at) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+                if (job.rolling) {
+                    // T1-1 roll in progress: keep the healthy replicas up, then advance one step per grace
+                    // window. Replace the oldest replica, wait ROLL_GRACE_TICKS for it to be raised into the
+                    // LB, then the next, until every replica runs the new spec. At all times replicas-1 stay
+                    // serving and the data-plane proxy retries around the one being swapped -> zero drops.
+                    job.sup.poll();
+                    if (job.rollGrace > 0) {
+                        job.rollGrace = job.rollGrace - 1;
+                    } else if (job.rollLeft > 0) {
+                        job.sup.rollOne();
+                        job.rollLeft = job.rollLeft - 1;
+                        job.rollGrace = ROLL_GRACE_TICKS;
+                    } else {
+                        job.rolling = false;         // roll complete
+                    }
+                } else if (spec.specsEqualExceptReplicas(job.desired, m.spec) && job.desired.replicas != m.spec.replicas) {
+                    // PURE SCALE change (only the replica count differs). Adopt it immediately and bring the
+                    // running replica count to the new desired with ensureReplicas (spawn up / stop down) --
+                    // NOT a rolling bounce. Scaling out must not disturb the already-serving replicas, and
+                    // scaling in must actually shed replicas (a rolling replace would keep the old count and,
+                    // worse, a second scale change would be ignored until the roll drained). The next
+                    // publishDiscovery reflects the new endpoint set, and the data plane reshapes its pool.
+                    job.sup.setSpec(m.spec);
+                    job.desired = m.spec;
+                    job.sup.ensureReplicas();
+                } else if (!spec.specsEqual(job.desired, m.spec)) {
+                    // Spec changed (binary/env/isolation/...). If the new spec declares a pre-rollout migrate
+                    // step, run it to SUCCESS first and only then begin rolling; on failure do NOT touch the
+                    // running replicas (the old version keeps serving) and leave the change un-adopted so the
+                    // next tick retries. Migrations must be expand-only, so the still-running old replicas
+                    // tolerate the new schema during the roll (see data/migrate.lintExpandOnly).
+                    let gateOk = if (spec.hasMigrate(m.spec)) (self.runMigrate(m.spec) == 0) else true;
+                    if (gateOk) {
+                        // Begin a ROLLING replace instead of a hard bounce. Adopt the new spec so rollOne's
+                        // respawns use it, and remember it as desired (so the change is not re-detected every
+                        // tick). The running old-spec replicas keep serving until each is rolled.
+                        job.sup.setSpec(m.spec);
+                        job.desired = m.spec;
+                        // If the count also changed, converge to it now (add/remove replicas) so the roll
+                        // then replaces exactly the desired number under the new spec.
+                        job.sup.ensureReplicas();
+                        job.rolling = true;
+                        job.rollLeft = if (m.spec.replicas > 0) m.spec.replicas else 1;
+                        job.rollGrace = 0;
+                    } else {
+                        // Migration failed: rollout aborted. Keep the old replicas healthy and retry next tick.
+                        job.sup.poll();
+                    }
+                } else {
+                    job.sup.poll();                  // unchanged → restart any crashed replicas
+                }
+            } else {
+                // Brand-new workload. If it declares a migrate step, run it to SUCCESS before starting any
+                // replicas (there is nothing serving yet, so nothing is disrupted). On failure, start nothing
+                // this tick; the reconcile loop retries on the next tick and self-heals once the DB is ready.
+                let gateOk = if (spec.hasMigrate(m.spec)) (self.runMigrate(m.spec) == 0) else true;
+                if (gateOk) { self.newJob(m.key, m.spec); }
+            }
+            i = i + 1;
+        }
+
+        // Stop workloads whose manifest FILE was removed (present-but-unreadable ones stay, since their
+        // key IS in presentKeys). Iterate + mutate in place.
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            if (!nameIn(presentKeys, job.name)) {
+                job.sup.stopAll();
+                self.jobs.remove(j);           // don't advance j - the next job shifted into this slot
+            } else {
+                j = j + 1;
+            }
+        }
+    }
+
+    // The desired replica count of a workload by name, or -1 if there is no such job (observability /
+    // test signal: lets a caller confirm a store-driven spec change actually replaced the job).
+    pub fn desiredReplicas(self: Nativelet, name: string): int {
+        let at = self.findJobIdx(name);
+        if (at < 0) { return -1; }
+        return (self.jobs.get(at) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).desired.replicas;
+    }
+
+    // Total replicas running across all workloads (observability / test signal).
+    pub fn totalRunning(self: Nativelet): int {
+        let sum = 0;
+        let j = 0;
+        while (j < self.jobs.size()) {
+            sum = sum + (self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.running();
+            j = j + 1;
+        }
+        return sum;
+    }
+
+    // Per-workload observability snapshot (P4 metrics): one WorkloadStatus per running job, in job order.
+    // A caller scrapes this each tick for a /metrics endpoint or a structured log line -- the "replica
+    // count vs desired" and "restart counts" the Beta observability item calls for. Pure read, no mutation.
+    // Poll every workload's supervisor once: reap crashed replicas and restart them per policy (the "heal"
+    // half of a reconcile tick, decoupled from the manifest re-scan). Drives crash-loop recovery.
+    pub fn pollAll(self: Nativelet): void {
+        let j = 0;
+        while (j < self.jobs.size()) {
+            (self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.poll();
+            j = j + 1;
+        }
+    }
+
+    pub fn status(self: Nativelet): list.List<WorkloadStatus> {
+        let out = list.List<WorkloadStatus>();
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            let ws = WorkloadStatus(job.name, job.desired.replicas, job.sup.running(), job.sup.restarts);
+            ws.probeFails = job.probeFails;
+            ws.rolling = job.rolling;
+            out.push(ws);
+            j = j + 1;
+        }
+        return out;
+    }
+
+    // How many workloads are UNDER their desired replica count right now (running < desired). Zero = the
+    // whole fleet is at desired; nonzero is the single "are we converged?" gauge for an alert.
+    pub fn underProvisioned(self: Nativelet): int {
+        let n = 0;
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            if (job.sup.running() < job.desired.replicas) { n = n + 1; }
+            j = j + 1;
+        }
+        return n;
+    }
+
+    // Stop every workload (graceful). For daemon shutdown.
+    pub fn shutdown(self: Nativelet): void {
+        while (self.jobs.size() > 0) {
+            let idx = self.jobs.size() - 1;
+            (self.jobs.get(idx) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.stopAll();
+            self.jobs.remove(idx);
+        }
+    }
+
+    // Heal-probe every workload that configured one and RESTART any that fails `probeFall` CONSECUTIVE
+    // probes (the failure threshold honoured from the manifest, not a hardcoded constant): any single
+    // success resets the streak, so one flaky probe never bounces a healthy replica. Non-blocking: tcp/http
+    // probes are async, and the exec probe yields the reactor between polls so one slow command cannot
+    // stall the other workloads' probes. Called by the daemon loop after each reconcile.
+    pub async fn probeAndHeal(self: Nativelet): int {
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            if (probeConfigured(job.desired) && job.sup.running() > 0) {
+                let fall = if (job.desired.probeFall > 0) job.desired.probeFall else PROBE_FAIL_LIMIT;
+                let ok = await runProbe(job.desired);
+                let step = healStep(job.probeFails, ok, fall);
+                job.probeFails = step.fails;
+                if (step.restart) {
+                    job.sup.stopAll();              // `fall` failures in a row → restart the whole workload
+                    job.sup.start();
+                }
+            }
+            j = j + 1;
+        }
+        return 0;
+    }
+}
+
+// The outcome of one heal-probe step: the updated consecutive-failure streak and whether to restart now.
+pub struct HealStep {
+    pub fails: int,
+    pub restart: bool,
+    init(fails: int, restart: bool) { self.fails = fails; self.restart = restart; }
+}
+
+// Pure heal-loop hysteresis, extracted so it is unit-testable without a live probe. This is a LIVENESS
+// (restart) probe, so it uses a failure-threshold model exactly like a Kubernetes livenessProbe: `fails`
+// counts CONSECUTIVE failures and is RESET TO ZERO by any single success, and the workload is restarted
+// only when the streak reaches `fall`. So a replica that fails one probe but passes the next is never
+// bounced -- only `fall` failures with no success in between restart it (on restart the streak resets).
+// `fall` is floored at 1 so a zero from an older spec cannot wedge the loop.
+pub fn healStep(fails: int, ok: bool, fall: int): HealStep {
+    if (ok) { return HealStep(0, false); }               // any success breaks the consecutive streak
+    let f = if (fall > 0) fall else 1;
+    let nfails = fails + 1;
+    if (nfails >= f) { return HealStep(0, true); }       // `fall` failures in a row -> restart, reset
+    return HealStep(nfails, false);
+}
+
+// True when a workload declares a kynatord-side heal probe: an "exec" probe needs a non-empty command;
+// "http"/"tcp" need a probePort. A workload with none is supervised on process liveness alone.
+fn probeConfigured(s: spec.Spec): bool {
+    if (string.eql(s.probeType, "exec")) { return s.probeCmd.size() > 0; }
+    return s.probePort > 0;
+}
+
+// Dispatch the heal probe by type: "tcp" (bare connect), "exec" (run probeCmd, exit 0 = healthy), or
+// "http" (the default GET probe). A foreign binary that speaks no HTTP uses tcp or exec.
+async fn runProbe(s: spec.Spec): bool {
+    if (string.eql(s.probeType, "tcp")) {
+        return await tcpProbe("127.0.0.1", s.probePort, 1000);
+    }
+    if (string.eql(s.probeType, "exec")) {
+        return await execProbe(s.probeCmd);
+    }
+    return await httpProbe("127.0.0.1", s.probePort, s.probePath, 1000);
+}
+
+// One-shot async TCP-connect liveness probe: a successful connect is healthy, any connect failure is not.
+// The stream is closed immediately (which deregisters the fd from the reactor, same discipline as httpProbe).
+async fn tcpProbe(host: string, port: int, tmo: int): bool {
+    let s = await aio.asyncConnect(host, port);
+    let ok = s.ok();
+    if (ok) { s.close(); }
+    return ok;
+}
+
+// One-shot "exec" liveness probe: run probeCmd (probeCmd[0] is the binary, the rest are args) and treat
+// exit code 0 as healthy, anything else (non-zero exit, or a spawn/overrun) as unhealthy. Bounded by a
+// wall-clock deadline: a probe that overruns is SIGKILLed and declared unhealthy so it cannot wedge the
+// heal loop. Crucially this is ASYNC and YIELDS the reactor (`await aio.delay`) between poll attempts
+// rather than busy-spinning, so a slow probe command does not block the reconcile loop, the HA lease
+// renew, or the OTHER workloads' probes on the single reactor thread. This is a SUPERVISOR probe: it runs
+// in the trusted control plane against a command the operator placed in the manifest, so there is no
+// untrusted-input concern beyond what the operator already controls.
+async fn execProbe(cmd: list.List<string>): bool {
+    if (cmd.size() < 1) { return false; }
+    let bin = cmd.get(0) ?? "";
+    let args = list.List<string>();
+    let i = 1;
+    while (i < cmd.size()) { args.push(cmd.get(i) ?? ""); i = i + 1; }
+    let p = process.Process.spawn(bin, args);
+    let startNs = datetime.nowNs();
+    let budgetNs: long = 2000 * 1000000;    // 2s wall-clock budget for the probe command
+    let rc = -2;
+    while (true) {
+        rc = p.tryWait();
+        if (rc != -2) { break; }
+        if (datetime.nowNs() - startNs >= budgetNs) { break; }
+        let _ = await aio.delay(20);        // yield: let other coroutines run between poll attempts
+    }
+    if (rc == -2) {
+        let _ = p.forceKill();              // overran the budget -> SIGKILL, treat as unhealthy
+        let _ = p.wait();
+    }
+    p.close();
+    return rc == 0;
+}
+
+// One-shot async HTTP GET liveness probe: connect, send GET, read the status line, accept 2xx/3xx.
+// Any connect/read failure or a >=400 status is unhealthy. Fully non-blocking.
+async fn httpProbe(host: string, port: int, path: string, tmo: int): bool {
+    // Use the AsyncStream's OWN methods (sendStr/recvInto/close), not the retired free-function Asio hooks
+    // (aio.async_write / aio.async_read_deadline are dead stubs that return 0). On a reactor thread
+    // asyncConnect returns a REACTOR-NATIVE stream (kq set, sock = raw fd), and its methods route through
+    // net/reactorio; crucially s.close() DEREGISTERS the fd from the reactor. The old code closed the fd
+    // with a raw aclose(s.sock) that left the reactor registration dangling, so a later completion/event
+    // for that fd resumed an already-freed coroutine frame -> a garbage-handle resume that crashed kynatord
+    // (BUS) within a few probe ticks of supervising a workload.
+    let s = await aio.asyncConnect(host, port);
+    if (!s.ok()) { return false; }
+    let req = `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    let _ = await s.sendStr(req);
+    let cap = 512;
+    let buf = bytes.alloc(cap);
+    let _ = s.setTimeout(tmo);
+    let n = await s.recvInto(buf, cap);
+    s.close();
+    if (n <= 0) { bytes.free(buf); return false; }
+    // Parse the status code out of the status line robustly, WITHOUT assuming the version token is exactly
+    // "HTTP/1.1 ". The status line is `<version> <code> <reason>`, so: scan to the first space (end of the
+    // version token, whatever it is -- "HTTP/1.0", "HTTP/1.1", "HTTP/2"), skip any run of spaces, then read
+    // up to three decimal digits as the code. 2xx/3xx = healthy (200..399), same semantics as before.
+    let i = 0;
+    while (i < n && bytes.read_byte(buf, i) != 32) { i = i + 1; }   // 32 = ' '
+    while (i < n && bytes.read_byte(buf, i) == 32) { i = i + 1; }   // skip extra spacing
+    let code = 0;
+    let digits = 0;
+    while (i < n && digits < 3) {
+        let ch = bytes.read_byte(buf, i);
+        if (ch < 48 || ch > 57) { break; }             // 48..57 = '0'..'9'
+        code = code * 10 + (ch - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    bytes.free(buf);
+    return digits == 3 && code >= 200 && code < 400;   // 2xx (2xx) or 3xx
+}
+
+fn nameIn(names: list.List<string>, target: string): bool {
+    let i = 0;
+    while (i < names.size()) {
+        if (string.eql(names.get(i) ?? "", target)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The reconcile daemon: reconcile every `intervalMs`, forever. Runs as one coroutine - spawn it or call
+// it from an async entry after holdReactors().
+pub async fn run(n: Nativelet, intervalMs: int): int {
+    let dt = (intervalMs as double) / 1000.0;   // reconcile interval in seconds, for the autoscaler
+    while (true) {
+        n.reconcile();
+        // Advertise the desired endpoints BEFORE the probes: publication reflects the reconciled topology
+        // and must not wait on (or be blocked by) a slow/failing health probe. No-op unless discoveryFile set.
+        n.publishDiscovery();
+        let _ = await n.probeAndHeal();
+        // Autoscale AFTER heal so the scaler drives the replica count off a fully-reconciled fleet.
+        n.autoscaleTick(dt);
+        let _ = await aio.delay(intervalMs);
+    }
+    return 0;
+}

@@ -1,0 +1,190 @@
+// store/config.ky -- the etcd-shaped config-store core (P1 of the orchestrator config-store design,
+// docs/beta-config-store-design.md).
+//
+// This is the REFERENCE implementation of the config store the orchestrator reconciles from: a KV space
+// with a monotonically increasing global `revision`, per-key mod-revision, prefix listing, compare-and-set
+// on revision (the primitive the leader lease and safe writes in P3 need), delete, and a poll-based watch
+// (changes since a revision). It is fully in-memory and deterministic so it is unit-testable offline --
+// the same "offline core proven here, live wiring proven separately" split the nativelet uses.
+//
+// Binding this to BTreeDB over the async database interface (a SqlConfigBackend that maps put -> UPSERT with a
+// new revision, get/list -> SELECT, cas -> UPDATE ... WHERE revision = ?, using ExecResult.rowsAffected)
+// is the integration step that turns P1's single-node gate green; that path compiles against the interface and
+// is exercised against a live server, not in this offline unit.
+//
+// Keys are held in a List (not Map<string, ConfigEntry>: a cross-module struct-valued Map mono-miscompiles
+// today -- see nativelet.ky -- and a list keeps list()/watch() ordering deterministic anyway; a config
+// store holds few keys).
+
+import list;
+import string;
+
+// A stored key with the global revision at which it was last written (etcd's mod_revision), plus the audit
+// trail of the LAST write: who made it (updatedBy) and when (updatedAt, unix seconds; 0 = unstamped). The
+// 3-arg init leaves the audit fields empty so every existing `?? ConfigEntry(k, v, r)` fallback and the
+// oracle keep compiling unchanged; put/cas stamp them, and the SQL backend persists them as two columns.
+pub struct ConfigEntry {
+    pub key: string,
+    pub value: string,
+    pub revision: long,
+    pub updatedBy: string,
+    pub updatedAt: long,     // unix seconds of the last write; 0 = unstamped
+    init(key: string, value: string, revision: long) {
+        self.key = key;
+        self.value = value;
+        self.revision = revision;
+        self.updatedBy = "";
+        self.updatedAt = 0;
+    }
+}
+
+// A change observed by watch(): an upsert (deleted = false) under the watched prefix since some revision.
+pub struct ConfigEvent {
+    pub key: string,
+    pub value: string,
+    pub revision: long,
+    pub deleted: bool,
+    init(key: string, value: string, revision: long, deleted: bool) {
+        self.key = key;
+        self.value = value;
+        self.revision = revision;
+        self.deleted = deleted;
+    }
+}
+
+// ConfigStore is a CLASS (reference type): it is a SHARED, mutable store -- multiple LeaderLease / config
+// clients hold the SAME store and observe each other's writes (the "one shared store, two nodes" contention
+// model). A value struct would (correctly, under value semantics) be DEEP-COPIED when stored into a field or
+// passed by value, so each holder would get an independent copy and the sharing contract would break. Model
+// it as reference data.
+pub class ConfigStore {
+    entries: list.List<ConfigEntry>,
+    rev: long,   // global monotonic revision; 0 = empty store, first write yields revision 1
+
+    init() {
+        self.entries = list.List<ConfigEntry>();
+        self.rev = 0;
+    }
+
+    // Index of `key` in entries, or -1 if absent (linear scan; workloads are few).
+    fn indexOf(self: ConfigStore, key: string): int {
+        let i = 0;
+        while (i < self.entries.size()) {
+            if (string.eql(self.entries.at(i).key, key)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // The current global revision (the revision of the last write). 0 on an empty store.
+    pub fn revision(self: ConfigStore): long {
+        return self.rev;
+    }
+
+    // --- restore hooks (durable snapshot reload, artifacts/cfgstore.ky) --------------------------
+    // These let a durable wrapper reload a persisted snapshot WITHOUT going through put()/cas(), which
+    // would re-number revisions and break watch(sinceRevision) continuity across a restart. They append
+    // an entry verbatim and set the global revision to the persisted high-water. Used only on load, from
+    // a single writer; not part of the reconcile/lease data path.
+    pub fn restoreEntry(self: ConfigStore, e: ConfigEntry): void {
+        self.entries.push(e);
+    }
+    pub fn setRevision(self: ConfigStore, r: long): void {
+        self.rev = r;
+    }
+
+    // Unconditional write by an unnamed actor (the deterministic oracle default; audit fields stay empty).
+    pub fn put(self: ConfigStore, key: string, value: string): long {
+        return self.putBy(key, value, "system", 0);
+    }
+
+    // Unconditional write WITH an audit trail: `by` = the actor identity, `atSecs` = a caller-supplied
+    // unix-seconds timestamp (injected rather than read from a clock so the offline oracle stays
+    // deterministic). Bumps the global revision, stamps the entry, returns the new revision.
+    pub fn putBy(self: ConfigStore, key: string, value: string, by: string, atSecs: long): long {
+        self.rev = self.rev + 1;
+        let e = ConfigEntry(key, value, self.rev);
+        e.updatedBy = by;
+        e.updatedAt = atSecs;
+        let i = self.indexOf(key);
+        if (i >= 0) {
+            self.entries.set(i, e);
+        } else {
+            self.entries.push(e);
+        }
+        return self.rev;
+    }
+
+    // Read a key. Returns the entry, or undefined if absent.
+    pub fn get(self: ConfigStore, key: string): ConfigEntry | undefined {
+        let i = self.indexOf(key);
+        if (i < 0) { return undefined; }
+        return self.entries.at(i);
+    }
+
+    pub fn exists(self: ConfigStore, key: string): bool {
+        return self.indexOf(key) >= 0;
+    }
+
+    // All entries whose key starts with `prefix`, in insertion order (deterministic). The reconcile loop
+    // reads desired state via list("workloads/") instead of scanning the manifest directory.
+    pub fn list(self: ConfigStore, prefix: string): list.List<ConfigEntry> {
+        let out = list.List<ConfigEntry>();
+        let i = 0;
+        while (i < self.entries.size()) {
+            let e = self.entries.at(i);
+            if (string.startsWith(e.key, prefix)) { out.push(e); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Compare-and-set on revision -- the optimistic-concurrency primitive for the leader lease and safe
+    // writes. Succeeds iff the key's current revision == expectedRevision; pass expectedRevision 0 to
+    // require the key be ABSENT (a create). On success writes and bumps the global revision, returning it;
+    // on a mismatch returns -1 and writes nothing (the caller re-reads and retries).
+    pub fn cas(self: ConfigStore, key: string, value: string, expectedRevision: long): long {
+        return self.casBy(key, value, expectedRevision, "system", 0);
+    }
+
+    // CAS with an audit trail (see putBy for the `by`/`atSecs` contract).
+    pub fn casBy(self: ConfigStore, key: string, value: string, expectedRevision: long, by: string, atSecs: long): long {
+        let i = self.indexOf(key);
+        if (expectedRevision == 0) {
+            if (i >= 0) { return -1; }        // create-only: must be absent
+        } else {
+            if (i < 0) { return -1; }         // update-only: must exist
+            if (self.entries.at(i).revision != expectedRevision) { return -1; }
+        }
+        return self.putBy(key, value, by, atSecs);
+    }
+
+    // Remove a key. Bumps the global revision so subsequent revision() reflects the change. Returns true
+    // if the key was present. (Reconcile treats absence-from-list() as "stop this workload"; a tombstoned
+    // delete-event stream is a follow-on with the SQL backend.)
+    pub fn del(self: ConfigStore, key: string): bool {
+        let i = self.indexOf(key);
+        if (i < 0) { return false; }
+        self.rev = self.rev + 1;
+        self.entries.remove(i);
+        return true;
+    }
+
+    // Poll-based watch: every entry under `prefix` written AFTER sinceRevision. A reconcile/follower loop
+    // passes its last-seen revision to get only the changes since then (a push channel is a later
+    // optimization; polling the revision is the initial model per the design).
+    pub fn watch(self: ConfigStore, prefix: string, sinceRevision: long): list.List<ConfigEvent> {
+        let out = list.List<ConfigEvent>();
+        let i = 0;
+        while (i < self.entries.size()) {
+            let e = self.entries.at(i);
+            if (string.startsWith(e.key, prefix)) {
+                if (e.revision > sinceRevision) {
+                    out.push(ConfigEvent(e.key, e.value, e.revision, false));
+                }
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+}

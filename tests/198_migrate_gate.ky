@@ -1,0 +1,129 @@
+// 198 -- pre-rollout schema-migration GATE, deterministic and in-process via the simulated hook.
+//
+// A workload may declare a migrate step (Spec.migrateArgs / manifest `migrate: { args: [...] }`). When it
+// does, the reconcile loop runs the workload's own binary once, to SUCCESS, BEFORE it starts or rolls the
+// app replicas; a non-zero exit aborts the rollout and keeps the last-good replicas serving. Nativelet's
+// simMigrateExit hook injects the one-shot's exit code so this runs with no real process or database.
+import assert;
+import orch.spec;
+import orch.supervisor;
+import orch.nativelet;
+import orch.manifest;
+import list;
+import string;
+
+fn jobAt(n: nativelet.Nativelet, i: int): nativelet.Job {
+    return n.jobs.get(i) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+}
+
+fn appSpec(name: string, bin: string, migrate: bool): spec.Spec {
+    let sp = spec.Spec(name, bin);
+    sp.replicas = 2;
+    sp.restartPolicy = "always";
+    if (migrate) { sp.migrateArgs.push("--migrate"); }
+    return sp;
+}
+
+fn simNativelet(migrateExit: int): nativelet.Nativelet {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;   // no real spawns
+    n.simulated = true;          // virtual replicas
+    n.servicePath = "";          // no companion-service expansion
+    n.simMigrateExit = migrateExit;
+    return n;
+}
+
+fn desiredOf(sp: spec.Spec): list.List<spec.Spec> {
+    let d = list.List<spec.Spec>();
+    d.push(sp);
+    return d;
+}
+
+// ---- Spec + manifest wiring ----
+
+@test
+fn test_spec_parses_migrate_block_and_hasMigrate(): void {
+    let s = spec.parseSpec("{\"name\":\"web\",\"binaryPath\":\"/bin/web\",\"migrate\":{\"args\":[\"--migrate\"],\"timeoutMs\":5000}}");
+    assert.isTrue(spec.hasMigrate(s));
+    assert.equalInt(s.migrateArgs.size(), 1);
+    assert.isTrue(string.eql(s.migrateArgs.get(0) ?? "", "--migrate"));
+    assert.equalInt(s.migrateTimeoutMs, 5000);
+
+    // No migrate block -> no gate.
+    let s2 = spec.parseSpec("{\"name\":\"web\",\"binaryPath\":\"/bin/web\"}");
+    assert.isTrue(!spec.hasMigrate(s2));
+    assert.equalInt(s2.migrateArgs.size(), 0);
+}
+
+@test
+fn test_validate_rejects_negative_migrate_timeout(): void {
+    let s = spec.Spec("web", "/bin/web");
+    s.migrateTimeoutMs = -1;
+    assert.isTrue(!string.eql(spec.validateSpec(s), ""));
+    s.migrateTimeoutMs = 0;
+    assert.isTrue(string.eql(spec.validateSpec(s), ""));   // 0 = no timeout, valid
+}
+
+@test
+fn test_manifest_migrate_round_trips(): void {
+    let text = "apiVersion: kyte/v1\nkind: App\nmetadata:\n  name: web\nworkload:\n  binary: ./bin/web\nmigrate:\n  args:\n    - --migrate\n  timeoutMs: 120000\n";
+    let m = manifest.parseManifest(text);
+    let sp = manifest.toSpec(m);
+    assert.isTrue(spec.hasMigrate(sp));
+    assert.equalInt(sp.migrateArgs.size(), 1);
+    assert.isTrue(string.eql(sp.migrateArgs.get(0) ?? "", "--migrate"));
+    assert.equalInt(sp.migrateTimeoutMs, 120000);
+    // toYaml emits the block so a control plane can store + rewrite the manifest.
+    assert.isTrue(string.contains(manifest.toYaml(m), "migrate:"));
+}
+
+// ---- new-workload gate ----
+
+@test
+fn test_new_workload_migrate_success_starts_replicas(): void {
+    let n = simNativelet(0);                         // migrate succeeds
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web", true)));
+    assert.equalInt(n.jobs.size(), 1);               // job created
+    assert.equalInt(n.totalRunning(), 2);            // replicas started AFTER the gate passed
+}
+
+@test
+fn test_new_workload_migrate_failure_starts_nothing(): void {
+    let n = simNativelet(1);                         // migrate FAILS
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web", true)));
+    assert.equalInt(n.jobs.size(), 0);               // nothing started
+    assert.equalInt(n.totalRunning(), 0);
+    // A workload WITHOUT a migrate step ignores simMigrateExit and starts regardless.
+    n.reconcileWith(desiredOf(appSpec("plain", "/bin/plain", false)));
+    assert.equalInt(n.jobs.size(), 1);
+    assert.equalInt(n.totalRunning(), 2);
+}
+
+// ---- spec-change gate on an existing, running workload ----
+
+@test
+fn test_spec_change_migrate_success_begins_roll(): void {
+    let n = simNativelet(0);
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web-v1", false)));   // v1 up, no migrate
+    assert.equalInt(n.totalRunning(), 2);
+
+    // v2 changes the binary AND declares a migrate step -> gate runs (exit 0) -> roll begins, v2 adopted.
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web-v2", true)));
+    let job = jobAt(n, 0);
+    assert.isTrue(job.rolling);
+    assert.isTrue(string.eql(job.desired.binaryPath, "/bin/web-v2"));
+}
+
+@test
+fn test_spec_change_migrate_failure_keeps_old_and_aborts_roll(): void {
+    let n = simNativelet(1);                                            // migrate FAILS
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web-v1", false)));   // v1 up
+    assert.equalInt(n.totalRunning(), 2);
+
+    // v2 with a failing migrate -> rollout aborted: old replicas keep serving, spec NOT adopted, no roll.
+    n.reconcileWith(desiredOf(appSpec("web", "/bin/web-v2", true)));
+    let job = jobAt(n, 0);
+    assert.isTrue(!job.rolling);                                        // did not begin rolling
+    assert.isTrue(string.eql(job.desired.binaryPath, "/bin/web-v1"));  // still the last-good spec
+    assert.equalInt(n.totalRunning(), 2);                              // old replicas untouched
+}

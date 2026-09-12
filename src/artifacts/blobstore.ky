@@ -1,0 +1,96 @@
+import io.file;
+import io.dir;
+import string;
+import crypto.hash.sha;
+import crypto.random;
+
+pub struct BlobStore {
+    root: string,
+
+    init(root: string) {
+        self.root = root;
+    }
+
+    fn shardDir(self: BlobStore, sha: string): string {
+        return self.root + "/" + string.slice(sha, 0, 2) + "/" + string.slice(sha, 2, 4);
+    }
+
+    pub fn localPath(self: BlobStore, sha: string): string {
+        return self.shardDir(sha) + "/" + sha;
+    }
+
+    pub fn validSha(self: BlobStore, sha: string): bool {
+        if (string.len(sha) != 64) {
+            return false;
+        }
+        let i = 0;
+        while (i < 64) {
+            let c = sha[i];
+            let ok = c >= 48 && c <= 57 || c >= 97 && c <= 102;
+            if (!ok) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    pub fn has(self: BlobStore, sha: string): bool {
+        if (!self.validSha(sha)) {
+            return false;
+        }
+        return File.exists(self.localPath(sha));
+    }
+
+    pub fn get(self: BlobStore, sha: string): string | undefined {
+        if (!self.has(sha)) {
+            return undefined;
+        }
+        let data = File.readText(self.localPath(sha));
+        if (!string.eql(hash256(data), sha)) {
+            return undefined;
+        }
+        return data;
+    }
+
+    pub fn put(self: BlobStore, sha: string, data: string): bool {
+        if (!self.validSha(sha)) {
+            return false;
+        }
+        if (!string.eql(hash256(data), sha)) {
+            return false;
+        }
+        if (self.has(sha)) {
+            return true;
+        }
+        ensureDir(self.shardDir(sha));
+        let p = self.localPath(sha);
+        let tmp = p + "." + random.randomHex(8) + ".tmp";
+        if (!File.writeTextOk(tmp, data)) {
+            return false;
+        }
+        if (Dir.rename(tmp, p) == 0) {
+            return true;
+        }
+        let _ = File.remove(tmp);
+        return false;
+    }
+}
+
+fn hash256(data: string): string {
+    return sha.sha256(data);
+}
+
+fn ensureDir(path: string): void {
+    let n = string.len(path);
+    let i = 1;
+    while (i <= n) {
+        if (i == n || path[i] == 47) {
+            let prefix = string.slice(path, 0, i);
+            if (!string.eql(prefix, "") && !string.eql(prefix, "/")) {
+                let _ = Dir.create(prefix, 493);
+            }
+        }
+        i = i + 1;
+    }
+}

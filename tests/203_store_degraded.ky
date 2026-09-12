@@ -1,0 +1,83 @@
+// Store-failure degradation (Orch robustness #1), now over the artifactd-hosted HttpConfigStore (NovaDB
+// removed). When the config store is unreachable, HttpConfigStore's round-trip comes back as a transport
+// failure (a synthetic 5xx from the HTTP client on a refused connection), so `reachable` goes false and
+// the HA lease degrades safely instead of pretending the lease is free / there are no members. This test
+// points the store at a closed port (no server needed -- the connection is refused deterministically) and
+// asserts the whole chain:
+//   - store.ping()/reachable report false,
+//   - the lease cannot falsely acquire (no split-brain from a dead store),
+//   - a reconcile tick steps down and does not converge, and
+//   - the health report is not-ready / not-healthy.
+import assert;
+import string;
+import store.httpconfig;
+import orch.asynclease;
+import orch.nativelet;
+import orch.health;
+
+// A store pointed at a closed port: every round-trip is refused, exactly what a down artifactd looks
+// like. 65533 is chosen to be unused; connecting to it returns ECONNREFUSED immediately (offline, fast).
+fn deadStore(): httpconfig.HttpConfigStore {
+    return httpconfig.HttpConfigStore("http://127.0.0.1:65533", "");
+}
+
+@test
+fn test_store_ping_reports_unreachable(): void {
+    let store = deadStore();
+    assert.isTrue(!store.ping());          // the probe round-trips and comes back failed
+    assert.isTrue(!store.reachable);       // and the flag is now false
+    // A read against a dead store returns undefined AND marks unreachable (not "no such key").
+    let got = store.get("anything");
+    assert.isTrue(got == undefined);
+    assert.isTrue(!store.reachable);
+}
+
+@test
+fn test_dead_store_cannot_falsely_acquire(): void {
+    // The core safety property: a node that cannot reach the store must NOT become leader, else two
+    // partitioned nodes could both "win". The create-only CAS fails (unreachable), and the reachability
+    // gate on hasQuorum refuses too.
+    let lease = asynclease.AsyncLeaderLease(deadStore(), "node-1", "leases/leader", 5000);
+    let acquired = lease.tryAcquire(1000);
+    assert.isTrue(!acquired);
+    assert.isTrue(!lease.isLeader);
+}
+
+@test
+fn test_reconcile_tick_degrades_and_does_not_converge(): void {
+    let lease = asynclease.AsyncLeaderLease(deadStore(), "node-1", "leases/leader", 5000);
+    let n = nativelet.Nativelet("unused-dir");
+    let acted = lease.haReconcileTick(n, "workloads/", 1000);
+    assert.isTrue(!acted);                 // did not act as leader
+    assert.isTrue(!lease.storeReachable);  // recorded the outage
+    assert.isTrue(!lease.isLeader);        // stepped down
+    assert.equalStr(lease.roleName(), "standby");
+}
+
+@test
+fn test_health_report_is_not_ready_when_store_down(): void {
+    let lease = asynclease.AsyncLeaderLease(deadStore(), "node-1", "leases/leader", 5000);
+    let n = nativelet.Nativelet("unused-dir");
+    let _ = lease.haReconcileTick(n, "workloads/", 1000);
+    let report = health.haReport(lease, n);
+    assert.isTrue(!report.storeReachable);
+    assert.isTrue(!report.healthy());      // liveness: store unreachable = degraded
+    assert.isTrue(!report.ready());        // readiness: not ready to take traffic
+    assert.equalStr(report.healthzText(), "degraded");
+    assert.equalStr(report.readyzText(), "not ready");
+}
+
+@test
+fn test_leader_that_loses_store_steps_down(): void {
+    // A node that BELIEVED it was leader, then loses the store, must step down (renew clears isLeader
+    // on the failed read) and report not-ready, rather than keep acting as leader.
+    let lease = asynclease.AsyncLeaderLease(deadStore(), "node-1", "leases/leader", 5000);
+    lease.isLeader = true;
+    lease.myEpoch = 3;
+    let acted = lease.haReconcileTick(n0(), "workloads/", 2000);
+    assert.isTrue(!acted);
+    assert.isTrue(!lease.isLeader);
+    assert.isTrue(!lease.storeReachable);
+}
+
+fn n0(): nativelet.Nativelet { return nativelet.Nativelet("unused-dir"); }

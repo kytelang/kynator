@@ -1,0 +1,559 @@
+// orch/manifest.ky - the DECLARATIVE app manifest (YAML), the single source of truth for a workload.
+//
+// One YAML document describes everything the control plane needs to run and front an app: the binary
+// and how many replicas to keep (a min/max band), the autoscaler policy, the load-balancer strategy,
+// health probing, network exposure, HTTP routes, and resource limits. It replaces the scattered
+// config (service.json + env vars + code-configured autoscaler): kynatord loads these manifests, the
+// gateway reads the LB/exposure, and the autoscaler reads its gains - all from here.
+//
+// Parsed with the compiler-generated binder over YAML: `Manifest__bind(source.fromYaml(text))`. Every
+// nested struct is @serializable with a zero-arg init() that sets defaults, so a partial manifest
+// fills in sensible values. Shape (see examples/manifests/shop.yaml):
+//
+//   apiVersion: kyte/v1
+//   kind: App
+//   metadata: { name: shop }
+//   workload: { binary: ./bin/webapp, args: [], restartPolicy: always }
+//   replicas: { min: 2, max: 6 }
+//   autoscale: { enabled: true, metric: inflight, target: 8, intervalMs: 2000 }
+//   lb: { strategy: roundrobin, handoff: true }
+//   health: { path: /healthz, intervalMs: 2000, timeoutMs: 1000, rise: 2, fall: 3 }
+//   network: { expose: gateway-only }
+//   routes: [ /api/products, /api/orders ]
+//   resources: { cpuMilli: 500, memMaxBytes: 268435456, pidsMax: 128 }
+import serde.source;
+import io.file;
+import string;
+import list;
+import orch.spec;
+import orch.secrets;
+import net.proxy;
+import net.autoscale;
+import net.netns;
+import platform;
+
+@serializable
+struct Metadata {
+    pub name: string,        // unique workload key
+    init() { self.name = ""; }
+}
+
+@serializable
+struct Workload {
+    pub binary: string,          // native executable to run per replica (a LOCAL path; used when artifact is empty)
+    // Content-addressed binary: "sha256:<hex>". When set, kynatord pulls the binary by hash into its blob
+    // cache and runs the verified copy instead of `binary`. This is what the deploy action fills in, so
+    // the same manifest names the exact bytes to run. Empty = legacy local-path mode via `binary`.
+    pub artifact: string,
+    pub args: List<string>,      // argv (excluding the binary and the injected port)
+    pub restartPolicy: string,   // always | on-failure | never
+    // Foreign-workload support (see FOREIGN-WORKLOADS.md). workloadType "kyte" (default) or "foreign":
+    // a foreign binary (Go/Rust/C#-AOT) gets no migrate step, no companion Kyte service, and is defaulted
+    // off fd-handoff onto a real listening port that the gateway byte-forwards to.
+    pub workloadType: string,
+    pub env: List<string>,       // extra "KEY=VALUE" environment entries applied to every replica
+    pub secrets: List<string>,   // file-mounted secret handles, each "ENVVAR=/abs/path" (PATH only, never the value)
+    pub workdir: string,         // working directory ("" = inherit); set for a tarball artifact's extract dir
+    pub portEnv: string,         // env var the assigned port is delivered through (default "KYTE_PORT"; "PORT" for many foreign apps)
+    pub artifactKind: string,    // "single" (default; blob is the executable) or "tarball" (extracted per-workload)
+    init() {
+        self.binary = "";
+        self.artifact = "";
+        self.args = List<string>();
+        self.restartPolicy = "always";
+        self.workloadType = "kyte";
+        self.env = List<string>();
+        self.secrets = List<string>();
+        self.workdir = "";
+        self.portEnv = "KYTE_PORT";
+        self.artifactKind = "single";
+    }
+}
+
+// The replica band the autoscaler operates within. A fixed count is min == max.
+@serializable
+struct Replicas {
+    pub min: int,
+    pub max: int,
+    init() { self.min = 1; self.max = 1; }
+}
+
+// Autoscaler policy, modelled on the Kubernetes HPA: pick a metric and a target value, and Kynator keeps
+// the replica count (within [replicas.min, replicas.max]) so the metric sits near that target. `metric`
+// selects the regulated signal: "inflight" (in-flight requests per replica, the gateway's own load
+// metric) or "cpu" (per-replica CPU utilisation, Linux cgroups). Convergence is driven by a PID with
+// fixed, conservative internal gains (see net/autoscale.PidController); those gains are deliberately NOT
+// part of the manifest surface, so an operator tunes behaviour with the target and the replica band, not
+// with control-theory constants.
+@serializable
+struct Autoscale {
+    pub enabled: bool,
+    pub metric: string,          // inflight | cpu
+    // Target value of the metric, PER REPLICA. inflight: in-flight requests (e.g. 8). cpu: percent of one
+    // core (e.g. 70 = 70%). The controller adds or removes replicas to keep the metric near this value.
+    pub target: double,
+    pub intervalMs: int,         // control loop period in ms (optional; default 2000)
+    init() {
+        self.enabled = false;
+        self.metric = "inflight";
+        self.target = 0.0;
+        self.intervalMs = 2000;
+    }
+}
+
+// Load-balancer facing this app. `handoff` selects the fire-and-forget fd-passing data path (the app
+// receives client sockets over the gateway's AF_UNIX rendezvous and is NOT exposed on a TCP port);
+// otherwise the gateway byte-forwards to the replicas.
+@serializable
+struct Lb {
+    pub strategy: string,        // roundrobin | weighted | leastconn | consistenthash
+    pub handoff: bool,           // fd-passing data path - the DEFAULT (out-of-path); set false for classic L7
+    init() { self.strategy = "roundrobin"; self.handoff = true; }
+}
+
+@serializable
+struct Health {
+    pub path: string,            // "" = TCP-connect probe; non-empty = HTTP GET, expect 2xx/3xx
+    pub intervalMs: int,
+    pub timeoutMs: int,
+    pub rise: int,               // consecutive OK probes to return a backend to rotation
+    pub fall: int,               // consecutive failed probes to drain a backend
+    // kynatord-side heal-probe type: "http" (default), "tcp" (bare connect), or "exec" (run probeCmd,
+    // exit 0 = healthy). This is the SUPERVISOR liveness probe (nativelet.heal), distinct from the
+    // data-plane service health checks. `probeCmd` is the argv for an exec probe.
+    pub probeType: string,
+    pub probeCmd: List<string>,
+    init() {
+        self.path = "/healthz";
+        self.intervalMs = 2000;
+        self.timeoutMs = 1000;
+        self.rise = 2;
+        self.fall = 3;
+        self.probeType = "http";
+        self.probeCmd = List<string>();
+    }
+}
+
+// Network exposure INTENT. The isolation implementation is platform-selected (like the reactor backend):
+// "gateway-only" => the app is reachable ONLY through the gateway - via fd-handoff on macOS/Windows (the
+// app has no listening TCP port) or a veth + network namespace on Linux; "public" => the app binds a
+// host port directly (dev convenience, not for production).
+@serializable
+struct Network {
+    pub expose: string,          // gateway-only | public
+    // Exposure port config, used ONLY when expose == "public": replica i binds portBase + i and the
+    // supervisor passes that port via portFlag on spawn (e.g. "--port"). Ignored for gateway-only
+    // (handoff apps have no listening port). portBase 0 = not directly exposed.
+    pub portBase: int,
+    pub portFlag: string,
+    // The public front port the workload's SERVICE (gateway) listens on. Clients hit this; the service
+    // hands connections to the app replicas (handoff) or forwards to them. Default 8080.
+    pub servicePort: int,
+    init() { self.expose = "gateway-only"; self.portBase = 0; self.portFlag = ""; self.servicePort = 8080; }
+}
+
+// cgroups-v2 resource limits (Linux; 0 = unset). cpuMilli is milli-CPU (500 = 0.5 core).
+@serializable
+struct Resources {
+    pub cpuMilli: int,
+    pub memMaxBytes: long,
+    pub pidsMax: int,
+    init() { self.cpuMilli = 0; self.memMaxBytes = 0; self.pidsMax = 0; }
+}
+
+// Pre-rollout database-migration gate. When args is non-empty, kynatord runs the workload's own binary
+// once with these args (conventionally ["--migrate"]) to SUCCESS before it starts or rolls the app; a
+// non-zero exit aborts the rollout and keeps the last-good replicas serving. timeoutMs bounds the run (0
+// = wait indefinitely). The migrations ship inside the same artifact, so code and schema never drift.
+@serializable
+struct Migrate {
+    pub args: List<string>,
+    pub timeoutMs: int,
+    init() { self.args = List<string>(); self.timeoutMs = 0; }
+}
+
+@serializable
+struct Manifest {
+    pub apiVersion: string,
+    pub kind: string,
+    pub metadata: Metadata,
+    pub workload: Workload,
+    pub replicas: Replicas,
+    pub autoscale: Autoscale,
+    pub lb: Lb,
+    pub health: Health,
+    pub network: Network,
+    pub resources: Resources,
+    pub migrate: Migrate,
+    pub routes: List<string>,
+    // Set by parseManifest when the raw manifest fails a textual precheck the serde binder cannot express
+    // (currently the env-shape lint, see envShapeError). validateManifest returns it first. Not a YAML field.
+    pub bindError: string,
+    // NOTE: the app's own `config:` section is intentionally NOT modelled here. It is the application's
+    // configuration, read by the app itself from the manifest file via the framework loader (web.config).
+    // kynatord does not parse or inject it, so serde simply ignores the `config:` key when binding a Manifest.
+    init() {
+        self.apiVersion = "kyte/v1";
+        self.kind = "App";
+        self.metadata = Metadata();
+        self.workload = Workload();
+        self.replicas = Replicas();
+        self.autoscale = Autoscale();
+        self.lb = Lb();
+        self.health = Health();
+        self.network = Network();
+        self.resources = Resources();
+        self.migrate = Migrate();
+        self.routes = List<string>();
+        self.bindError = "";
+    }
+}
+
+// LOCKED env shape (1.0): `workload.env` is an ARRAY of "KEY=VALUE" strings, e.g.
+//     env: [ "PORT=8080", "LOG=info" ]        (or the block "- \"PORT=8080\"" form)
+// A YAML MAP (`env: { PORT: 8080 }` / a `key: value` block) is NOT the committed surface. The serde binder
+// silently binds a map to an EMPTY list, which would drop the operator's variables with no signal, so this
+// raw-text lint detects the map form and returns a clear error instead. Returns "" when the env form is the
+// array form (or env is absent). Best-effort textual check (kynatord already trusts its own manifests); it
+// keys off the one `env:` line, so an app's own embedded `config:` env is out of scope by construction.
+pub fn envShapeError(text: string): string {
+    let lines = string.split(text, "\n");
+    let i = 0;
+    while (i < lines.size()) {
+        let raw = lines.get(i) ?? "";
+        let t = string.trim(raw);
+        if (string.startsWith(t, "env:")) {
+            let rest = string.trim(string.slice(t, 4, string.len(t)));
+            if (string.startsWith(rest, "{")) {
+                return "workload.env must be an array of \"KEY=VALUE\" strings, not a map (got `env: {...}`)";
+            }
+            if (!string.eql(rest, "")) { return ""; }    // inline `env: [ ... ]` or a scalar -> array form
+            // Block form: inspect the first deeper-indented, non-blank line. A sequence item starts with
+            // "-"; a "key: value" line means the operator wrote a MAP where an array is required.
+            let envIndent = string.len(raw) - string.len(string.trimStart(raw));
+            let j = i + 1;
+            while (j < lines.size()) {
+                let nraw = lines.get(j) ?? "";
+                let nt = string.trim(nraw);
+                if (string.eql(nt, "")) { j = j + 1; continue; }
+                let nIndent = string.len(nraw) - string.len(string.trimStart(nraw));
+                if (nIndent <= envIndent) { return ""; }              // block ended, env was empty -> fine
+                if (string.startsWith(nt, "-")) { return ""; }        // a sequence -> array form, good
+                if (string.contains(nt, ":")) {
+                    return "workload.env must be an array of \"KEY=VALUE\" strings, not a map (found a `key: value` entry under `env:`)";
+                }
+                return "";
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Parse a YAML manifest string into a Manifest (defaults fill any absent field). The env-shape lint runs
+// here (it needs the raw text) and its result rides on `bindError`, which validateManifest surfaces first.
+pub fn parseManifest(text: string): Manifest {
+    let m = Manifest__bind(source.fromYaml(text));
+    m.bindError = envShapeError(text);
+    return m;
+}
+
+// Load and parse a manifest file. Returns a Manifest with all-default fields if the file is missing
+// (validate() then reports the empty name/binary).
+pub fn loadManifest(path: string): Manifest {
+    if (!file.File.exists(path)) { return Manifest(); }
+    return parseManifest(file.File.readText(path));
+}
+
+fn oneOf(v: string, a: string, b: string, c: string, d: string): bool {
+    return string.eql(v, a) || string.eql(v, b) || string.eql(v, c) || string.eql(v, d);
+}
+
+// Validate a manifest; returns "" when valid, else the first problem. Keeps the control plane from
+// acting on a nonsensical spec (empty name/binary, an inverted replica band, an unknown enum).
+pub fn validateManifest(m: Manifest): string {
+    if (!string.eql(m.bindError, "")) { return m.bindError; }   // textual precheck (env shape) failed
+    if (string.eql(m.metadata.name, "")) { return "metadata.name is required"; }
+    if (string.eql(m.workload.binary, "") && string.eql(m.workload.artifact, "")) {
+        return "workload needs either binary (a local path) or artifact (a sha256:<hex> to pull)";
+    }
+    if (m.replicas.min < 1) { return "replicas.min must be >= 1"; }
+    if (m.replicas.max < m.replicas.min) { return "replicas.max must be >= replicas.min"; }
+    if (!oneOf(m.lb.strategy, "roundrobin", "weighted", "leastconn", "consistenthash")) {
+        return "lb.strategy must be roundrobin | weighted | leastconn | consistenthash";
+    }
+    if (!string.eql(m.network.expose, "gateway-only") && !string.eql(m.network.expose, "public")) {
+        return "network.expose must be gateway-only | public";
+    }
+    if (m.autoscale.enabled) {
+        if (!string.eql(m.autoscale.metric, "inflight") && !string.eql(m.autoscale.metric, "cpu")) {
+            return "autoscale.metric must be inflight | cpu";
+        }
+        if (m.autoscale.target <= 0.0) { return "autoscale.target must be > 0 when autoscaling"; }
+    }
+    // env is the LOCKED array-of-"KEY=VALUE" surface: every entry must have a non-empty key and a "=".
+    let ei = 0;
+    while (ei < m.workload.env.size()) {
+        let e = m.workload.env.get(ei) ?? "";
+        let eq = string.indexOf(e, "=");
+        if (eq <= 0) {
+            return `workload.env[${ei}] must be "KEY=VALUE" with a non-empty key (got "${e}")`;
+        }
+        ei = ei + 1;
+    }
+    // secrets are file HANDLES: each entry must be "ENVVAR=/abs/path" (the value lives in the file, never here).
+    let sci = 0;
+    while (sci < m.workload.secrets.size()) {
+        let serr = secrets.secretRefError(m.workload.secrets.get(sci) ?? "");
+        if (!string.eql(serr, "")) { return `workload.secrets[${sci}]: ${serr}`; }
+        sci = sci + 1;
+    }
+    return "";
+}
+
+// Emit a Manifest back to canonical YAML - the inverse of parseManifest, so a control plane can store a
+// deployed app in one consistent form and rewrite it (e.g. scale replicas) without hand-editing text. The
+// field ORDER is fixed and readable (unlike the map-ordered serde.yaml.stringify), and every field the
+// schema models is emitted, so parseManifest(toYaml(m)) round-trips m for all behaviour-bearing fields.
+// A double is rendered via string interpolation; a bool as the literal true/false YAML expects.
+fn yamlBool(b: bool): string { return if (b) "true" else "false"; }
+
+pub fn toYaml(m: Manifest): string {
+    let out = list.List<string>();
+    out.push(`apiVersion: ${m.apiVersion}`);
+    out.push(`kind: ${m.kind}`);
+    out.push("metadata:");
+    out.push(`  name: ${m.metadata.name}`);
+    out.push("workload:");
+    if (!string.eql(m.workload.binary, "")) { out.push(`  binary: ${m.workload.binary}`); }
+    if (!string.eql(m.workload.artifact, "")) { out.push(`  artifact: ${m.workload.artifact}`); }
+    out.push(`  restartPolicy: ${m.workload.restartPolicy}`);
+    if (m.workload.args.size() > 0) {
+        out.push("  args:");
+        let a = 0;
+        while (a < m.workload.args.size()) { out.push(`    - ${m.workload.args.get(a) ?? ""}`); a = a + 1; }
+    }
+    if (!string.eql(m.workload.workloadType, "") && !string.eql(m.workload.workloadType, "kyte")) {
+        out.push(`  workloadType: ${m.workload.workloadType}`);
+    }
+    if (m.workload.env.size() > 0) {
+        out.push("  env:");
+        let ei = 0;
+        while (ei < m.workload.env.size()) { out.push(`    - "${m.workload.env.get(ei) ?? ""}"`); ei = ei + 1; }
+    }
+    // Emit secret HANDLES (paths) only -- there is no value here to leak; the round-trip must preserve them.
+    if (m.workload.secrets.size() > 0) {
+        out.push("  secrets:");
+        let si = 0;
+        while (si < m.workload.secrets.size()) { out.push(`    - "${m.workload.secrets.get(si) ?? ""}"`); si = si + 1; }
+    }
+    out.push("replicas:");
+    out.push(`  min: ${m.replicas.min}`);
+    out.push(`  max: ${m.replicas.max}`);
+    // The autoscale settings only matter when enabled; emit the block then so a scale round-trips, and
+    // just the disabled flag otherwise (validateManifest ignores the rest when disabled).
+    out.push("autoscale:");
+    out.push(`  enabled: ${yamlBool(m.autoscale.enabled)}`);
+    if (m.autoscale.enabled) {
+        out.push(`  metric: ${m.autoscale.metric}`);
+        out.push(`  target: ${m.autoscale.target}`);
+        out.push(`  intervalMs: ${m.autoscale.intervalMs}`);
+    }
+    out.push("lb:");
+    out.push(`  strategy: ${m.lb.strategy}`);
+    out.push(`  handoff: ${yamlBool(m.lb.handoff)}`);
+    out.push("health:");
+    out.push(`  path: ${m.health.path}`);
+    out.push(`  intervalMs: ${m.health.intervalMs}`);
+    out.push(`  timeoutMs: ${m.health.timeoutMs}`);
+    out.push(`  rise: ${m.health.rise}`);
+    out.push(`  fall: ${m.health.fall}`);
+    out.push("network:");
+    out.push(`  expose: ${m.network.expose}`);
+    // portBase/portFlag only bind an app under expose: public; emit them there so the round-trip is exact.
+    if (string.eql(m.network.expose, "public")) {
+        out.push(`  portBase: ${m.network.portBase}`);
+        if (!string.eql(m.network.portFlag, "")) { out.push(`  portFlag: ${m.network.portFlag}`); }
+    }
+    out.push(`  servicePort: ${m.network.servicePort}`);
+    // Resource limits (Linux cgroups); emit only when at least one is set to keep the manifest clean.
+    if (m.resources.cpuMilli > 0 || m.resources.memMaxBytes > 0 || m.resources.pidsMax > 0) {
+        out.push("resources:");
+        out.push(`  cpuMilli: ${m.resources.cpuMilli}`);
+        out.push(`  memMaxBytes: ${m.resources.memMaxBytes}`);
+        out.push(`  pidsMax: ${m.resources.pidsMax}`);
+    }
+    // Migrate gate: emit only when a step is declared, so a workload without migrations stays clean.
+    if (m.migrate.args.size() > 0) {
+        out.push("migrate:");
+        out.push("  args:");
+        let mg = 0;
+        while (mg < m.migrate.args.size()) { out.push(`    - ${m.migrate.args.get(mg) ?? ""}`); mg = mg + 1; }
+        if (m.migrate.timeoutMs > 0) { out.push(`  timeoutMs: ${m.migrate.timeoutMs}`); }
+    }
+    if (m.routes.size() > 0) {
+        out.push("routes:");
+        let r = 0;
+        while (r < m.routes.size()) { out.push(`  - ${m.routes.get(r) ?? ""}`); r = r + 1; }
+    }
+    return string.join(out, "\n") + "\n";
+}
+
+// Lower a Manifest to the supervisor's Spec, the interface between the declarative surface and the process
+// runner. The supervisor keeps `replicas` copies running; the INITIAL desired count is replicas.min, and
+// the control-plane autoscaler later drives spec.replicas within [replicas.min, replicas.max]. Exposure:
+// a "public" app binds network.portBase (+ i per replica) via portFlag and probes that port; a
+// "gateway-only" app is not directly exposed (basePort 0) - it is reached via the gateway (fd-handoff on
+// macOS/Windows, veth on Linux), so no host port is advertised.
+pub fn toSpec(m: Manifest): spec.Spec {
+    let s = spec.Spec(m.metadata.name, m.workload.binary);
+    s.artifact = m.workload.artifact;      // content-addressed binary (kynatord pulls by hash when set)
+    let i = 0;
+    while (i < m.workload.args.size()) { s.args.push(m.workload.args.get(i) ?? ""); i = i + 1; }
+    s.restartPolicy = m.workload.restartPolicy;
+    s.replicas = if (m.replicas.min < 1) 1 else m.replicas.min;
+    // Autoscaling: carry the policy onto the Spec so the nativelet's reconcile loop can drive the replica
+    // count between [min, max] toward the target (see nativelet.autoscaleTick). Off => the fixed `replicas`.
+    if (m.autoscale.enabled) {
+        s.autoscale = true;
+        s.autoMetric = if (string.eql(m.autoscale.metric, "")) "cpu" else m.autoscale.metric;
+        s.autoTarget = m.autoscale.target;
+        s.autoMin = if (m.replicas.min < 1) 1 else m.replicas.min;
+        s.autoMax = if (m.replicas.max < s.autoMin) s.autoMin else m.replicas.max;
+    }
+    s.cpuMilli = m.resources.cpuMilli;
+    s.memMaxBytes = m.resources.memMaxBytes;
+    s.pidsMax = m.resources.pidsMax;
+    s.probePath = m.health.path;
+    s.probePeriodMs = if (m.health.intervalMs > 0) m.health.intervalMs else 2000;
+    s.probeFall = if (m.health.fall > 0) m.health.fall else 3;
+    // Foreign-workload fields - set before the exposure-mode early returns so every path carries them.
+    s.workloadType = if (string.eql(m.workload.workloadType, "")) "kyte" else m.workload.workloadType;
+    s.workdir = m.workload.workdir;
+    s.portEnv = if (string.eql(m.workload.portEnv, "")) "KYTE_PORT" else m.workload.portEnv;
+    s.artifactKind = if (string.eql(m.workload.artifactKind, "")) "single" else m.workload.artifactKind;
+    let evi = 0;
+    while (evi < m.workload.env.size()) { s.env.push(m.workload.env.get(evi) ?? ""); evi = evi + 1; }
+    let sci = 0;
+    while (sci < m.workload.secrets.size()) { s.secretRefs.push(m.workload.secrets.get(sci) ?? ""); sci = sci + 1; }
+    s.probeType = if (string.eql(m.health.probeType, "")) "http" else m.health.probeType;
+    let pci = 0;
+    while (pci < m.health.probeCmd.size()) { s.probeCmd.push(m.health.probeCmd.get(pci) ?? ""); pci = pci + 1; }
+    let foreign = spec.isForeign(s);
+    // Pre-rollout migrate gate - Kyte-only. A foreign binary does not carry Kyte migrations, so never
+    // run it with --migrate; leave migrateArgs empty so hasMigrate() is false and the step is skipped.
+    if (!foreign) {
+        let mgi = 0;
+        while (mgi < m.migrate.args.size()) { s.migrateArgs.push(m.migrate.args.get(mgi) ?? ""); mgi = mgi + 1; }
+        s.migrateTimeoutMs = m.migrate.timeoutMs;
+    }
+    // A foreign workload cannot speak Kyte fd-handoff or share the netns/veth gateway data path, so it is
+    // steered onto a real listening port: it binds basePort+i (portFlag/portEnv deliver the port) and the
+    // `service` gateway byte-forwards to it. This overrides expose:gateway-only + lb.handoff for foreign.
+    if (foreign) {
+        s.handoff = false;
+        s.netns = false;
+        s.basePort = if (m.network.portBase > 0) m.network.portBase else 8080;
+        s.portFlag = m.network.portFlag;   // "" is fine: the port is also delivered via portEnv
+        s.servicePort = if (m.network.servicePort > 0) m.network.servicePort else 8080;
+        return s;
+    }
+    // Precedence: an explicitly PUBLIC app keeps its host port; otherwise (gateway-only) fd-passing
+    // handoff is the default data path (no listening port - the app receives client sockets over the
+    // service's AF_UNIX rendezvous, whose path is derived from the workload name so service + apps
+    // agree); netns is the gateway-only path only when handoff is explicitly turned off (Linux).
+    if (string.eql(m.network.expose, "public") && m.network.portBase > 0) {
+        s.basePort = m.network.portBase;
+        s.portFlag = m.network.portFlag;
+        // NOTE: probePort is deliberately left 0 (no kynatord-side HTTP readiness probe). Health/readiness is
+        // the DATA PLANE's job: the `service` load balancer actively health-checks every backend and gates
+        // traffic on it. kynatord owns SUPERVISION (process liveness via poll/tryWait, which respawns a
+        // crashed replica). An kynatord-side HTTP probe is redundant with the service's checks AND currently
+        // triggers a lang reactor bug (a recycled-coroutine-frame BUS crash in the reactor-native
+        // connect/recv path used by httpProbe, reproducible from the reconcile loop; see the driver-parity
+        // notes). Re-enable per-workload once that runtime bug is fixed.
+        return s;
+    }
+    if (m.lb.handoff) {
+        s.handoff = true;
+        s.handoffSock = `/tmp/kyte-${m.metadata.name}.sock`;
+        s.servicePort = if (m.network.servicePort > 0) m.network.servicePort else 8080;
+        return s;
+    }
+    let mode = isolationMode(m);
+    if (string.eql(mode, "netns")) {
+        // Linux gateway-only: each replica runs in its own netns and binds the SAME port on its private
+        // address; the supervisor advertises the private addresses. Port defaults to 8080 if unset.
+        s.netns = true;
+        s.basePort = if (m.network.portBase > 0) m.network.portBase else 8080;
+        s.portFlag = if (!string.eql(m.network.portFlag, "")) m.network.portFlag else "--port";
+        // probePort left 0: see the note on the public path above (data-plane health checks + supervisor
+        // liveness cover readiness; the kynatord HTTP probe is redundant and hits a reactor bug for now).
+    }
+    // handoff (mac/win) and loopback leave basePort 0 - the app is reached via the gateway, not a port.
+    return s;
+}
+
+// The Spec for the workload's SERVICE (gateway) process - the data-plane side kynatord launches alongside
+// the app replicas. It runs the `service` binary at `servicePath` in fd-handoff mode on the SAME
+// rendezvous the apps connect to (/tmp/kyte-<name>.sock), listening on network.servicePort. Run it via a
+// supervisor exactly like an app: the handoff Spec makes the supervisor set KYTE_HANDOFF_SOCK + KYTE_PORT
+// for the service child. Only meaningful when the workload is handoff (lb.handoff); returns a service
+// Spec regardless, so the caller gates on toSpec(m).handoff.
+pub fn serviceSpecFor(m: Manifest, servicePath: string): spec.Spec {
+    let s = spec.Spec(m.metadata.name + "-svc", servicePath);
+    s.replicas = 1;
+    s.restartPolicy = "always";
+    s.handoff = true;
+    s.handoffSock = `/tmp/kyte-${m.metadata.name}.sock`;
+    s.basePort = if (m.network.servicePort > 0) m.network.servicePort else 8080;
+    return s;
+}
+
+// Which isolation mechanism a gateway-only app uses on THIS host. The manifest declares the INTENT
+// (network.expose = gateway-only); the platform picks the implementation, the same way the reactor
+// backend is picked per OS:
+//   "handoff" - macOS/Windows: the app receives client sockets over the gateway's AF_UNIX rendezvous
+//               and has no listening TCP port (fd-passing).
+//   "netns"   - Linux with netns available: the app runs in its own network namespace behind a veth
+//               pair, reachable only at its private address (see net/netns).
+//   "loopback"- gateway-only but netns unavailable on Linux (no root/ip): bind loopback only, best effort.
+//   "public"  - network.expose = public: the app binds a host port directly (dev convenience).
+pub fn isolationMode(m: Manifest): string {
+    if (string.eql(m.network.expose, "public")) { return "public"; }
+    if (platform.isLinux) { return if (netns.available()) "netns" else "loopback"; }
+    return "handoff";
+}
+
+// The Linux network plan for a gateway-only app at replica slot `idx` (its private /30 + veth names).
+// Only meaningful when isolationMode(m) == "netns".
+pub fn netPlanFor(m: Manifest, idx: int): netns.NetPlan {
+    return netns.plan(m.metadata.name, idx);
+}
+
+// Build the load-balancer Pool the gateway fronts this app with, straight from the manifest: the LB
+// strategy and the active health-check policy. Backends are added by autoscalerFrom (which pre-registers
+// the replica slots) or by service discovery - poolFrom only sets policy.
+pub fn poolFrom(m: Manifest): proxy.Pool {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.strategyFromName(m.lb.strategy));
+    p.setHealthPath(m.health.path);
+    p.enableHealthChecks(m.health.intervalMs, m.health.timeoutMs, m.health.rise, m.health.fall);
+    return p;
+}
+
+// Build the control-plane autoscaler for this app over `pool`: the replica band [replicas.min,
+// replicas.max], the process command, the advertise host, and the exposure base port; then load the
+// target from autoscale.*. The Autoscaler constructor pre-registers replicas.max drained pool slots
+// (host:portBase+i), so after this the pool knows every slot the controller can scale into. The caller
+// runs the control loop only when m.autoscale.enabled (min == max otherwise pins the count).
+pub fn autoscalerFrom(m: Manifest, pool: proxy.Pool, host: string): autoscale.Autoscaler {
+    let base = if (m.network.portBase > 0) m.network.portBase else 0;
+    let a = autoscale.Autoscaler(pool, m.workload.binary, host, base, m.replicas.min, m.replicas.max);
+    // The PID gains are fixed, conservative internal defaults (net/autoscale.PidController): a gentle
+    // proportional term plus a little integral, no derivative. They are NOT a manifest knob; the operator
+    // only chooses the target and the replica band. Here we set just the target.
+    a.configure(0.5, 0.1, 0.0, m.autoscale.target);
+    return a;
+}

@@ -1,0 +1,140 @@
+// 205 -- foreign-workload support (see FOREIGN-WORKLOADS.md): kynatord supervising any self-contained
+// binary (Go/Rust/C#-AOT), not only Kyte apps. Deterministic and in-process: no real spawn except the
+// exec-bit test, which chmods a temp file it creates itself.
+import assert;
+import orch.spec;
+import orch.manifest;
+import orch.artifact;
+import artifacts.blobstore;
+import io.file;
+import list;
+import string;
+
+// --- Spec parse: the foreign fields round-trip from JSON --------------------------------------------
+@test
+fn parse_foreign_fields(): void {
+    let js = "{ \"name\":\"go-svc\", \"binaryPath\":\"/opt/go-svc\", \"workloadType\":\"foreign\","
+        + " \"portEnv\":\"PORT\", \"workdir\":\"/var/lib/go-svc\", \"artifactKind\":\"tarball\","
+        + " \"env\":[\"LOG=info\",\"REGION=in\"],"
+        + " \"probe\":{ \"port\":9000, \"type\":\"tcp\" } }";
+    let s = spec.parseSpec(js);
+    assert.isTrue(string.eql(s.workloadType, "foreign"));
+    assert.isTrue(spec.isForeign(s));
+    assert.isTrue(string.eql(s.portEnv, "PORT"));
+    assert.isTrue(string.eql(s.workdir, "/var/lib/go-svc"));
+    assert.isTrue(string.eql(s.artifactKind, "tarball"));
+    assert.equalInt(s.env.size(), 2);
+    assert.isTrue(string.eql(s.env.get(0) ?? "", "LOG=info"));
+    assert.isTrue(string.eql(s.probeType, "tcp"));
+}
+
+@test
+fn parse_defaults_are_kyte(): void {
+    let s = spec.parseSpec("{ \"name\":\"web\", \"binaryPath\":\"/opt/web\" }");
+    assert.isTrue(string.eql(s.workloadType, "kyte"));
+    assert.isTrue(!spec.isForeign(s));
+    assert.isTrue(string.eql(s.portEnv, "KYTE_PORT"));
+    assert.isTrue(string.eql(s.probeType, "http"));
+    assert.isTrue(string.eql(s.artifactKind, "single"));
+}
+
+// --- Validation: the foreign guardrails --------------------------------------------------------------
+fn okSpec(): spec.Spec {
+    let s = spec.Spec("w", "/opt/w");
+    s.restartPolicy = "always";
+    return s;
+}
+
+@test
+fn validate_rejects_bad_env_entry(): void {
+    let s = okSpec();
+    s.env.push("NOTKEYVALUE");                 // missing '='
+    assert.isTrue(!string.eql(spec.validateSpec(s), ""));
+    let s2 = okSpec();
+    s2.env.push("=novalue");                   // empty key
+    assert.isTrue(!string.eql(spec.validateSpec(s2), ""));
+    let s3 = okSpec();
+    s3.env.push("GOOD=1");                     // well-formed -> accepted
+    assert.isTrue(string.eql(spec.validateSpec(s3), ""));
+}
+
+@test
+fn validate_rejects_exec_probe_without_cmd(): void {
+    let s = okSpec();
+    s.probeType = "exec";
+    assert.isTrue(!string.eql(spec.validateSpec(s), ""));   // exec needs a cmd
+    s.probeCmd.push("/bin/check");
+    assert.isTrue(string.eql(spec.validateSpec(s), ""));    // now valid
+}
+
+@test
+fn validate_rejects_foreign_with_handoff(): void {
+    let s = okSpec();
+    s.workloadType = "foreign";
+    s.handoff = true;                          // a foreign binary cannot speak Kyte fd-handoff
+    assert.isTrue(!string.eql(spec.validateSpec(s), ""));
+}
+
+@test
+fn validate_rejects_unknown_probe_and_workload_type(): void {
+    let s = okSpec();
+    s.probeType = "bogus";
+    assert.isTrue(!string.eql(spec.validateSpec(s), ""));
+    let s2 = okSpec();
+    s2.workloadType = "kittens";
+    assert.isTrue(!string.eql(spec.validateSpec(s2), ""));
+}
+
+// --- specsEqual is sensitive to the new run-affecting fields -----------------------------------------
+@test
+fn specs_equal_tracks_new_fields(): void {
+    let a = okSpec();
+    let b = okSpec();
+    assert.isTrue(spec.specsEqual(a, b));
+    b.portEnv = "PORT";
+    assert.isTrue(!spec.specsEqual(a, b));      // a change in portEnv is a different workload
+    let c = okSpec();
+    c.env.push("X=1");
+    assert.isTrue(!spec.specsEqual(a, c));      // env difference too
+}
+
+// --- Manifest.toSpec: a foreign workload is steered off handoff onto a listening port ----------------
+@test
+fn manifest_foreign_off_handoff_onto_port(): void {
+    let y = "metadata:\n  name: gobin\n"
+        + "workload:\n  binary: /opt/gobin\n  workloadType: foreign\n  portEnv: PORT\n"
+        + "  env:\n    - LOG=info\n"
+        + "lb:\n  handoff: true\n"                 // handoff requested...
+        + "network:\n  expose: gateway-only\n  portBase: 9100\n"
+        + "migrate:\n  args:\n    - --migrate\n";   // ...and a migrate step requested
+    let m = manifest.parseManifest(y);
+    let s = manifest.toSpec(m);
+    assert.isTrue(spec.isForeign(s));
+    assert.isTrue(!s.handoff);                      // ...but foreign overrides handoff off
+    assert.equalInt(s.basePort, 9100);              // onto a real listening port
+    assert.isTrue(string.eql(s.portEnv, "PORT"));
+    assert.equalInt(s.env.size(), 1);
+    assert.equalInt(s.migrateArgs.size(), 0);       // migrate is Kyte-only, skipped for foreign
+    assert.isTrue(string.eql(spec.validateSpec(s), ""));
+}
+
+@test
+fn manifest_kyte_still_handoff(): void {
+    let y = "metadata:\n  name: web\n"
+        + "workload:\n  binary: /opt/web\n"
+        + "lb:\n  handoff: true\n"
+        + "network:\n  expose: gateway-only\n";
+    let m = manifest.parseManifest(y);
+    let s = manifest.toSpec(m);
+    assert.isTrue(!spec.isForeign(s));
+    assert.isTrue(s.handoff);                       // a Kyte workload keeps the fd-handoff default
+}
+
+// --- Exec-bit: kynatord owns chmod +x on a resolved binary -------------------------------------------
+@test
+fn ensure_executable_sets_exec_bit(): void {
+    let path = "/tmp/kynator_foreign_execbit_probe";
+    let _ = File.writeTextOk(path, "#!/bin/sh\nexit 0\n");
+    assert.isTrue(artifact.ensureExecutable(path));  // chmod 0o755 succeeds
+    let _ = File.remove(path);
+}

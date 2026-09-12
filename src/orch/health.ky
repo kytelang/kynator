@@ -1,0 +1,185 @@
+// orch/health.ky -- P4 Beta observability: the ORCHESTRATOR NODE's own self-health, readiness, and
+// metrics, distinct from the per-workload HTTP probes in net/proxy. Three surfaces a daemon serves:
+//   /healthz  -- liveness: is this process able to do its job at all (store reachable)?
+//   /readyz   -- readiness: may this node take its role's traffic (reachable AND a valid, unfenced role)?
+//   /metrics  -- a Prometheus-style scrape: node gauges + one line per workload.
+// The report is PURE DATA so all three render without a live dependency (offline test 193). The live daemon
+// fills it from the lease + nativelet + a replication-lag read-out via buildHealth/timedReconcile below.
+
+import store.config;
+import orch.nativelet;
+import orch.asynclease;
+import string;
+import list;
+import datetime;
+
+// Replication lag in raw frames: the leader's shipped WAL LSN minus the follower's confirmed seq. On the
+// leader this is 0 (it is the source of truth). A live daemon reads leaderLsn from its btree WAL head and
+// followerSeq from the peer's persisted FollowerState (a small btree read-out); offline it is built directly.
+pub struct ReplLag {
+    pub leaderLsn: long,
+    pub followerSeq: long,
+    init(leaderLsn: long, followerSeq: long) {
+        self.leaderLsn = leaderLsn;
+        self.followerSeq = followerSeq;
+    }
+    // Frames the follower is behind, clamped at 0 (a follower can momentarily report a seq ahead of the
+    // leader's cached LSN across a race; never publish a negative lag).
+    pub fn frames(self: ReplLag): long {
+        let d = self.leaderLsn - self.followerSeq;
+        if (d < 0) { return 0; }
+        return d;
+    }
+}
+
+// A point-in-time self-health snapshot of the orchestrator node.
+pub struct HealthReport {
+    pub role: string,              // "leader" | "standby" | "fenced" | "unknown"
+    pub epoch: long,               // fencing epoch this node holds (0 when not leader)
+    pub leader: string,            // current lease holder identity ("" if the lease row is absent)
+    pub storeReachable: bool,      // did the last store round-trip succeed
+    pub workloads: int,            // number of workloads the nativelet tracks
+    pub running: int,              // total replicas running across all workloads
+    pub underProvisioned: int,     // workloads with running < desired ("are we converged?" gauge)
+    pub reconcileLatencyMs: long,  // duration of the last reconcile tick
+    pub replicationLag: long,      // frames the follower is behind (0 on the leader)
+
+    init(role: string, epoch: long, leader: string, storeReachable: bool, workloads: int, running: int,
+         underProvisioned: int, reconcileLatencyMs: long, replicationLag: long) {
+        self.role = role;
+        self.epoch = epoch;
+        self.leader = leader;
+        self.storeReachable = storeReachable;
+        self.workloads = workloads;
+        self.running = running;
+        self.underProvisioned = underProvisioned;
+        self.reconcileLatencyMs = reconcileLatencyMs;
+        self.replicationLag = replicationLag;
+    }
+
+    // Liveness: can the process do its job at all? Store unreachable = degraded (cannot read/write desired
+    // state). A FENCED node is still live -- it serves reads -- so fencing is a readiness concern, not liveness.
+    pub fn healthy(self: HealthReport): bool { return self.storeReachable; }
+
+    // Readiness: may this node take its role's traffic? Ready when the store is reachable AND we hold a valid
+    // role (leader or standby). A fenced old leader, or an unknown-role node, is NOT ready.
+    pub fn ready(self: HealthReport): bool {
+        if (!self.storeReachable) { return false; }
+        if (string.eql(self.role, "leader")) { return true; }
+        if (string.eql(self.role, "standby")) { return true; }
+        if (string.eql(self.role, "standalone")) { return true; }   // a non-HA node is ready on its own
+        return false;
+    }
+
+    pub fn healthzText(self: HealthReport): string {
+        if (self.healthy()) { return "ok"; }
+        return "degraded";
+    }
+    pub fn readyzText(self: HealthReport): string {
+        if (self.ready()) { return "ready"; }
+        return "not ready";
+    }
+}
+
+fn boolMetric(b: bool): string {
+    if (b) { return "1"; }
+    return "0";
+}
+
+// A self-health report for a STANDALONE (non-HA) node: no lease, so role="standalone" (which ready()
+// treats as ready), the store is assumed reachable, and the workload gauges come straight from the
+// nativelet. kynatord uses this to publish /metrics + evaluate alerts without a config store or a lease.
+pub fn standaloneReport(n: nativelet.Nativelet): HealthReport {
+    return HealthReport("standalone", 0, "", true, n.jobs.size(), n.totalRunning(), n.underProvisioned(), 0, 0);
+}
+
+// A self-health report for an HA node, derived from the lease + nativelet after a reconcile tick.
+// The role and reachability come straight from the lease (roleName() maps an unreachable store to
+// "fenced"/"standby"), so when NovaDB is down this reports storeReachable=false -> healthy()=false,
+// ready()=false, and /readyz says "not ready" instead of the node silently pretending to lead.
+pub fn haReport(lease: asynclease.AsyncLeaderLease, n: nativelet.Nativelet): HealthReport {
+    let holder = "";
+    if (lease.isLeader) { holder = lease.nodeId; }
+    return HealthReport(lease.roleName(), lease.myEpoch, holder, lease.storeReachable,
+        n.jobs.size(), n.totalRunning(), n.underProvisioned(), 0, 0);
+}
+
+// Render Prometheus exposition text: node gauges + one line per workload (statuses = Nativelet.status(),
+// already in job order). A caller serves this verbatim at /metrics.
+// Escape a Prometheus label value (exposition format): `\`->`\\`, `"`->`\"`, LF->`\n`. Without this a
+// workload name containing a quote or newline would break the `{workload="..."}` label and corrupt the scrape.
+fn promLabel(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < string.len(s)) {
+        let c = s[i];
+        if (c == 92) { out = out + "\\\\"; }
+        else if (c == 34) { out = out + "\\\""; }
+        else if (c == 10) { out = out + "\\n"; }
+        else { out = out + string.charAt(s, i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn renderMetrics(r: HealthReport, statuses: list.List<nativelet.WorkloadStatus>): string {
+    let out = "";
+    out = out + "orch_up " + boolMetric(r.healthy()) + "\n";
+    out = out + "orch_ready " + boolMetric(r.ready()) + "\n";
+    out = out + "orch_store_reachable " + boolMetric(r.storeReachable) + "\n";
+    out = out + "orch_leader_epoch " + r.epoch + "\n";
+    out = out + "orch_workloads_total " + r.workloads + "\n";
+    out = out + "orch_running_total " + r.running + "\n";
+    out = out + "orch_under_provisioned " + r.underProvisioned + "\n";
+    out = out + "orch_reconcile_latency_ms " + r.reconcileLatencyMs + "\n";
+    out = out + "orch_replication_lag_frames " + r.replicationLag + "\n";
+    let i = 0;
+    while (i < statuses.size()) {
+        let s = statuses.get(i) ?? nativelet.WorkloadStatus("", 0, 0, 0);
+        out = out + "orch_workload_running{workload=\"" + promLabel(s.name) + "\"} " + s.running + "\n";
+        out = out + "orch_workload_desired{workload=\"" + promLabel(s.name) + "\"} " + s.desired + "\n";
+        out = out + "orch_workload_restarts{workload=\"" + promLabel(s.name) + "\"} " + s.restarts + "\n";
+        out = out + "orch_workload_probe_failures{workload=\"" + promLabel(s.name) + "\"} " + s.probeFails + "\n";
+        out = out + "orch_workload_rolling{workload=\"" + promLabel(s.name) + "\"} " + boolMetric(s.rolling) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+// Classify this node's role from the lease state at `nowMs`. Reads the store (currentEpoch/holder), so it is
+// the async live path. FENCED = we once held a lease (myEpoch > 0) but the store's high-water epoch has moved
+// past ours and we are no longer the valid leader -- a superseded old leader. STANDBY = a valid non-leader.
+pub async fn classifyRole(lease: asynclease.AsyncLeaderLease, nowMs: long): string {
+    if (await lease.stillLeader(nowMs)) { return "leader"; }
+    let storeEpoch = await lease.currentEpoch();
+    if (lease.myEpoch > 0 && storeEpoch > lease.myEpoch) { return "fenced"; }
+    return "standby";
+}
+
+// Build a live self-health report from the lease + nativelet + an injected replication-lag read-out and the
+// last measured reconcile latency. `nowMs` is the caller's clock for lease-validity checks. Assumes the store
+// round-trips succeeded (the awaits below did not throw); a daemon that catches a store-connect failure emits
+// a degraded report (storeReachable=false) directly instead of calling this.
+pub async fn buildHealth(lease: asynclease.AsyncLeaderLease, n: nativelet.Nativelet, lag: ReplLag,
+                         reconcileLatencyMs: long, nowMs: long): HealthReport {
+    let role = await classifyRole(lease, nowMs);
+    let holder = await lease.currentHolder();
+    // Lag is 0 on the leader (it is the source of truth); publish the follower's frames-behind otherwise.
+    let lagFrames = lag.frames();
+    if (string.eql(role, "leader")) { lagFrames = 0; }
+    return HealthReport(role, lease.myEpoch, holder, true, n.jobs.size(), n.totalRunning(),
+                        n.underProvisioned(), reconcileLatencyMs, lagFrames);
+}
+
+// Run ONE HA reconcile tick and return its wall-clock duration in milliseconds -- the real source for the
+// orch_reconcile_latency_ms metric. Wraps AsyncLeaderLease.haReconcileTick between two monotonic-clock reads
+// (datetime.nowNs). The bool "did we act as leader" is dropped here; call haReconcileTick directly if needed.
+pub async fn timedReconcile(lease: asynclease.AsyncLeaderLease, n: nativelet.Nativelet, prefix: string,
+                            nowMs: long): long {
+    let t0 = datetime.nowNs();
+    let _ = await lease.haReconcileTick(n, prefix, nowMs);
+    let t1 = datetime.nowNs();
+    let dns = t1 - t0;
+    if (dns < 0) { dns = 0; }
+    return dns / 1000000;
+}

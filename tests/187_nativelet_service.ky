@@ -1,0 +1,57 @@
+// 187 - kynatord (nativelet) launches each handoff workload's SERVICE alongside its apps. reconcile expands
+// a handoff app `web` into `web` + `web-svc` (the gateway on the same rendezvous), managed by the same
+// reconcile machinery. Simulated (virtual replicas) - no real processes.
+import assert;
+import string;
+import list;
+import orch.nativelet;
+import orch.spec;
+
+fn handoffApp(name: string, replicas: int): spec.Spec {
+    let s = spec.Spec(name, "/bin/" + name);
+    s.replicas = replicas;
+    s.handoff = true;
+    s.handoffSock = "/tmp/kyte-" + name + ".sock";
+    s.servicePort = 8080;
+    return s;
+}
+
+@test
+fn test_handoff_workload_gets_a_service_job(): void {
+    let n = nativelet.Nativelet("/nonexistent");
+    n.simulated = true;
+    n.servicePath = "/opt/kyte/bin/service";
+    let desired = list.List<spec.Spec>();
+    desired.push(handoffApp("web", 2));
+    n.reconcileWith(desired);
+
+    assert.isTrue(n.findJobIdx("web") >= 0);           // the app workload
+    assert.isTrue(n.findJobIdx("web-svc") >= 0);       // its companion service, launched by kynatord
+    assert.equalInt(n.desiredReplicas("web-svc"), 1);  // one service replica
+}
+
+@test
+fn test_no_service_path_no_service_job(): void {
+    let n = nativelet.Nativelet("/nonexistent");
+    n.simulated = true;                                // servicePath defaults ""
+    let desired = list.List<spec.Spec>();
+    desired.push(handoffApp("web", 2));
+    n.reconcileWith(desired);
+    assert.isTrue(n.findJobIdx("web") >= 0);
+    assert.isTrue(n.findJobIdx("web-svc") < 0);        // no service launched without a service binary path
+}
+
+@test
+fn test_service_job_torn_down_with_app(): void {
+    let n = nativelet.Nativelet("/nonexistent");
+    n.simulated = true;
+    n.servicePath = "/opt/kyte/bin/service";
+    let d1 = list.List<spec.Spec>();
+    d1.push(handoffApp("web", 2));
+    n.reconcileWith(d1);
+    assert.isTrue(n.findJobIdx("web-svc") >= 0);
+    // app removed from desired -> its service is not re-injected -> torn down too
+    n.reconcileWith(list.List<spec.Spec>());
+    assert.isTrue(n.findJobIdx("web") < 0);
+    assert.isTrue(n.findJobIdx("web-svc") < 0);
+}

@@ -1,0 +1,122 @@
+// 196 -- O5 observability: alert evaluation + the /metrics render kynatord publishes each tick. Pure/offline
+// (no sockets, no daemon): builds HealthReports + WorkloadStatuses directly and asserts which alerts fire,
+// their severities, the Prometheus render, and that a written metrics file carries the scrapeable series.
+import assert;
+import orch.health;
+import orch.alerts;
+import orch.nativelet;
+import list;
+import string;
+import io.file;
+
+fn oneStatus(name: string, desired: int, running: int, restarts: int): list.List<nativelet.WorkloadStatus> {
+    let l = list.List<nativelet.WorkloadStatus>();
+    l.push(nativelet.WorkloadStatus(name, desired, running, restarts));
+    return l;
+}
+
+fn okReport(): health.HealthReport {
+    // standalone, store reachable, nothing behind -- a healthy baseline.
+    return health.HealthReport("standalone", 0, "", true, 1, 1, 0, 0, 0);
+}
+
+// ---- node-level alerts ----
+
+@test
+fn test_store_unreachable_is_critical(): void {
+    let rep = health.HealthReport("standalone", 0, "", false, 0, 0, 0, 0, 0);
+    let al = alerts.evaluate(rep, list.List<nativelet.WorkloadStatus>(), alerts.AlertThresholds());
+    assert.isTrue(alerts.firing(al));
+    assert.isTrue(alerts.criticalCount(al) >= 1);
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "OrchStoreUnreachable"));
+}
+
+@test
+fn test_fenced_node_not_ready_is_critical(): void {
+    let rep = health.HealthReport("fenced", 1, "nodeB", true, 0, 0, 0, 0, 0);
+    let al = alerts.evaluate(rep, list.List<nativelet.WorkloadStatus>(), alerts.AlertThresholds());
+    assert.isTrue(alerts.criticalCount(al) >= 1);
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "OrchNotReady"));
+}
+
+@test
+fn test_healthy_standalone_no_alerts(): void {
+    let al = alerts.evaluate(okReport(), oneStatus("web", 1, 1, 0), alerts.AlertThresholds());
+    assert.isFalse(alerts.firing(al));
+}
+
+@test
+fn test_replication_lag_and_slow_reconcile(): void {
+    // Lag 500 frames, reconcile 900ms; thresholds 100 / 500 fire both (warnings).
+    let rep = health.HealthReport("standby", 0, "nodeA", true, 0, 0, 0, 900, 500);
+    let t = alerts.AlertThresholds();
+    t.replicationLagFrames = 100;
+    t.reconcileLatencyMs = 500;
+    let al = alerts.evaluate(rep, list.List<nativelet.WorkloadStatus>(), t);
+    let m = alerts.renderAlertMetrics(al);
+    assert.isTrue(string.contains(m, "ReplicationLagHigh"));
+    assert.isTrue(string.contains(m, "ReconcileSlow"));
+    // Both are warnings, not criticals.
+    assert.equalInt(alerts.criticalCount(al), 0);
+}
+
+// ---- per-workload alerts ----
+
+@test
+fn test_under_provisioned_is_warning(): void {
+    let al = alerts.evaluate(okReport(), oneStatus("web", 3, 1, 0), alerts.AlertThresholds());
+    assert.isTrue(alerts.firing(al));
+    assert.equalInt(alerts.criticalCount(al), 0);   // under-provisioned is a warning
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "WorkloadUnderProvisioned"));
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "workload=\"web\""));
+}
+
+@test
+fn test_crash_loop_is_critical_at_threshold(): void {
+    let t = alerts.AlertThresholds();   // crashLoopRestarts default 5
+    // 4 restarts: below threshold, no crash-loop alert (fully provisioned so no other alert either).
+    let below = alerts.evaluate(okReport(), oneStatus("web", 1, 1, 4), t);
+    assert.isFalse(string.contains(alerts.renderAlertMetrics(below), "WorkloadCrashLoop"));
+    // 5 restarts: fires critical.
+    let at = alerts.evaluate(okReport(), oneStatus("web", 1, 1, 5), t);
+    assert.isTrue(alerts.criticalCount(at) >= 1);
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(at), "WorkloadCrashLoop"));
+}
+
+@test
+fn test_crash_loop_disabled_when_threshold_zero(): void {
+    let t = alerts.AlertThresholds();
+    t.crashLoopRestarts = 0;   // disabled
+    let al = alerts.evaluate(okReport(), oneStatus("web", 1, 1, 99), t);
+    assert.isFalse(string.contains(alerts.renderAlertMetrics(al), "WorkloadCrashLoop"));
+}
+
+// ---- standalone report + full /metrics publication ----
+
+@test
+fn test_standalone_report_is_ready(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;
+    let rep = health.standaloneReport(n);
+    assert.isTrue(rep.healthy());
+    assert.isTrue(rep.ready());
+    assert.equalStr(rep.role, "standalone");
+}
+
+@test
+fn test_metrics_file_carries_series_and_alerts(): void {
+    // A workload at 1/3 replicas -> under-provisioned. Render the full /metrics payload kynatord writes and
+    // confirm a scraper would see both the gauges and the alert series.
+    let rep = okReport();
+    let st = oneStatus("web", 3, 1, 0);
+    let al = alerts.evaluate(rep, st, alerts.AlertThresholds());
+    let text = health.renderMetrics(rep, st) + alerts.renderAlertMetrics(al);
+
+    let path = "/tmp/kyte_orch_test_metrics.prom";
+    file.File.writeText(path, text);
+    let readBack = file.File.readText(path);
+    assert.isTrue(string.contains(readBack, "orch_up 1"));
+    assert.isTrue(string.contains(readBack, "orch_workload_running{workload=\"web\"} 1"));
+    assert.isTrue(string.contains(readBack, "orch_workload_desired{workload=\"web\"} 3"));
+    assert.isTrue(string.contains(readBack, "orch_alert{name=\"WorkloadUnderProvisioned\""));
+}

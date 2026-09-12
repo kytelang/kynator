@@ -1,0 +1,108 @@
+// orch/isolation.ky - cgroups-v2 resource limits for supervised workloads (I2).
+//
+// On Linux, applies a Spec's CPU / memory / PID limits by writing the unified cgroup-v2 files under
+// /sys/fs/cgroup/kyte/<name>/ and attaching the child PID, exactly like the Zig PoC's isolation.zig
+// (the same "just write the files" trick - no libcgroup, no FFI). On macOS / anywhere without cgroup-v2
+// the writes simply fail and are ignored (best-effort), so the orchestrator still runs, just unlimited.
+//
+// cgroup-v2 must be mounted at /sys/fs/cgroup and the daemon must have write access (root, or a
+// delegated sub-tree). Detection is by the presence of /sys/fs/cgroup/cgroup.controllers.
+
+import io.file;
+import io.dir;
+import string;
+import orch.spec;
+
+// Is a writable cgroup-v2 hierarchy present? (Linux with cgroup-v2 mounted.)
+pub fn available(): bool {
+    return file.File.exists("/sys/fs/cgroup/cgroup.controllers");
+}
+
+// Can this process actually create + delegate the kyte cgroup subtree? True only when cgroup-v2 is present
+// AND we have permission to prepare it (root, or a delegated sub-tree). An unprivileged Linux host has
+// cgroup-v2 mounted (available() is true) but rejects the writes, so a limit would be silently dropped;
+// this is the honest "will limits stick?" probe the supervisor reports on. Idempotent (ensureParent is).
+pub fn writable(): bool {
+    if (!available()) { return false; }
+    return ensureParent();
+}
+
+// Does this spec ask for ANY OS-level isolation or resource limit (cgroups CPU/mem/pids, a container
+// isolation level, or a network namespace)? Used to decide whether to REPORT that limits were requested
+// but could not be applied on this platform, so the orchestrator never silently runs unconstrained while a
+// manifest asked for a limit (acceptance bar item 6).
+pub fn requestsIsolation(sp: spec.Spec): bool {
+    return sp.cpuMilli > 0 || sp.memMaxBytes > (0 as long) || sp.pidsMax > 0 || sp.isolationLevel > 0 || sp.netns;
+}
+
+const CGROUP_ROOT: string = "/sys/fs/cgroup/kyte";
+
+fn cgroupDir(name: string): string {
+    return CGROUP_ROOT + "/" + name;
+}
+
+// Prepare the parent cgroup that holds every workload's leaf group. Two things must be true before a leaf
+// like /sys/fs/cgroup/kyte/<name> exposes cpu.max / memory.max / pids.max:
+//   1. the parent directory exists (a single mkdir -- the kernel makes it a cgroup automatically), and
+//   2. the parent DELEGATES the controllers to its children via cgroup.subtree_control, otherwise the leaf
+//      has no controller-interface files and every limit write fails with ENOENT.
+// The controllers must themselves be enabled at the real root's subtree_control first; on a systemd host
+// that is already the case (cpu memory pids). Idempotent + best-effort: on an unprivileged host the
+// subtree_control write is rejected, which surfaces as failed limit writes in applyLimits (reported, not
+// silently claimed). Returns true if the controllers are now delegated (the leaf can be constrained).
+fn ensureParent(): bool {
+    let _ = dir.Dir.create(CGROUP_ROOT, 493);        // mkdir 0755; ignore "already exists"
+    // Enable exactly the controllers we write. A combined write is atomic in cgroup-v2; if any controller
+    // is unavailable at this level the whole write is rejected and limits then fail (correctly reported).
+    return file.File.writeTextOk(CGROUP_ROOT + "/cgroup.subtree_control", "+cpu +memory +pids\n");
+}
+
+// Apply the Spec's cgroups-v2 limits to an already-running child `pid`. Best-effort: on any platform
+// without cgroup-v2 (or without permission) this is a no-op. Returns true if the hierarchy was present
+// and the attach was attempted, false if skipped.
+//   cpuMilli  → cpu.max "quota period" (quota = cpuMilli/1000 · 100000us period)
+//   memMax    → memory.max (bytes)
+//   pidsMax   → pids.max (fork-bomb guard)
+pub fn applyLimits(sp: spec.Spec, pid: long): bool {
+    if (!available()) { return false; }
+    let _ = ensureParent();                      // create /sys/fs/cgroup/kyte + delegate cpu/memory/pids
+    let d = cgroupDir(sp.name);
+    let _ = dir.Dir.create(d, 493);              // mkdir 0755; ignore "already exists"
+
+    // Check every write: on an unprivileged Linux host the cgroup writes are REJECTED, which previously
+    // passed silently and returned true (a false "limits applied"). Now any failed limit write, or a failed
+    // process attach, makes applyLimits return false so the supervisor reports the downgrade.
+    let ok = true;
+    if (sp.cpuMilli > 0) {
+        let period = 100000;
+        let quota = (sp.cpuMilli * period) / 1000;
+        if (!file.File.writeTextOk(d + "/cpu.max", "" + quota + " " + period + "\n")) { ok = false; }
+    }
+    if (sp.memMaxBytes > 0) {
+        if (!file.File.writeTextOk(d + "/memory.max", "" + sp.memMaxBytes + "\n")) { ok = false; }
+    }
+    if (sp.pidsMax > 0) {
+        if (!file.File.writeTextOk(d + "/pids.max", "" + sp.pidsMax + "\n")) { ok = false; }
+    }
+    // Attach the process LAST (writing cgroup.procs moves it into the constrained group). A failed attach
+    // means the process is NOT constrained -- the most important write to report.
+    if (!file.File.writeTextOk(d + "/cgroup.procs", "" + pid + "\n")) { ok = false; }
+    return ok;
+}
+
+// Cumulative CPU time (microseconds) a workload's cgroup has consumed - the "usage_usec" line of
+// cpu.stat. The autoscaler samples this each tick and divides the delta by the interval to get CPU
+// utilisation. Returns -1 if unavailable (non-Linux / no cgroup / not yet created).
+pub fn cpuUsageUsec(name: string): long {
+    let path = cgroupDir(name) + "/cpu.stat";
+    if (!file.File.exists(path)) { return -1; }
+    let text = file.File.readText(path);
+    // find "usage_usec <n>" (first line of cpu.stat)
+    let key = "usage_usec ";
+    let at = string.indexOf(text, key);
+    if (at < 0) { return -1; }
+    let rest = string.slice(text, at + string.len(key), string.len(text));
+    let nl = string.indexOf(rest, "\n");
+    let numStr = if (nl < 0) rest else string.slice(rest, 0, nl);
+    return string.parseI64(numStr);
+}

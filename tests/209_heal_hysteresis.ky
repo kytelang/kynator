@@ -1,0 +1,73 @@
+// 209 -- heal-loop failure-threshold hysteresis (ROADMAP-1.0 Tier 2 health-probe coverage). This is a
+// LIVENESS/restart probe (like a Kubernetes livenessProbe): a workload is restarted only after `fall`
+// CONSECUTIVE failed heal probes, and ANY single success resets the streak -- so a replica that fails one
+// probe but passes the next is never bounced. Tests the pure decision function nativelet.healStep (the
+// heal loop's hysteresis, minus the live probe).
+import assert;
+import orch.nativelet;
+import list;
+
+// Drive a sequence of probe results (true=ok) through healStep, carrying the fail streak, and return how
+// many restarts fired across the sequence.
+fn restartsOver(results: list.List<bool>, fall: int): int {
+    let fails = 0;
+    let restarts = 0;
+    let i = 0;
+    while (i < results.size()) {
+        let step = nativelet.healStep(fails, results.get(i) ?? true, fall);
+        fails = step.fails;
+        if (step.restart) { restarts = restarts + 1; }
+        i = i + 1;
+    }
+    return restarts;
+}
+
+fn seq4(a: bool, b: bool, c: bool, d: bool): list.List<bool> {
+    let l = list.List<bool>();
+    l.push(a); l.push(b); l.push(c); l.push(d);
+    return l;
+}
+
+@test
+fn single_flaky_probe_does_not_restart(): void {
+    // fall=3: one failure surrounded by successes must NOT restart.
+    assert.equalInt(restartsOver(seq4(true, false, true, true), 3), 0);
+}
+
+@test
+fn interrupted_failures_never_reach_fall(): void {
+    // fail, fail, PASS, fail: the pass resets the consecutive streak, so 3-in-a-row is never reached.
+    assert.equalInt(restartsOver(seq4(false, false, true, false), 3), 0);
+}
+
+@test
+fn fall_consecutive_failures_restart_once(): void {
+    // exactly `fall` failures in a row -> one restart; the streak resets so the 4th starts fresh (count 1).
+    assert.equalInt(restartsOver(seq4(false, false, false, false), 3), 1);
+}
+
+@test
+fn a_single_success_resets_the_streak(): void {
+    let s1 = nativelet.healStep(0, false, 3);   // fail -> 1
+    assert.equalInt(s1.fails, 1);
+    let s2 = nativelet.healStep(s1.fails, false, 3);   // fail -> 2
+    assert.equalInt(s2.fails, 2);
+    let s3 = nativelet.healStep(s2.fails, true, 3);    // ok -> reset to 0
+    assert.equalInt(s3.fails, 0);
+    assert.isTrue(!s3.restart);
+}
+
+@test
+fn fall_one_restarts_on_first_failure(): void {
+    // fall=1 (no tolerance): the very first failure restarts, then the streak resets.
+    let s = nativelet.healStep(0, false, 1);
+    assert.isTrue(s.restart);
+    assert.equalInt(s.fails, 0);
+}
+
+@test
+fn zero_fall_is_floored_to_one(): void {
+    // A 0 from an older spec must not wedge the loop (floor to 1): first failure restarts.
+    let s = nativelet.healStep(0, false, 0);
+    assert.isTrue(s.restart);
+}

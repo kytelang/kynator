@@ -1,0 +1,52 @@
+// orch/membership.ky -- O3: automate cluster membership (add / remove / list) as config-store rows under
+// a "members/" prefix, so joining or removing a node is a single store write instead of a manual runbook
+// step. Removing the current leader's row leaves the lease to expire and a peer to re-elect (bounded by the
+// TTL). quorum() is the N/2+1 gate a caller checks before allowing an election, so a minority partition
+// cannot elect. Pure over the ConfigStore interface -> deterministic offline, identical live.
+import store.config;
+import list;
+import string;
+
+const PREFIX: string = "members/";
+
+pub fn add(store: config.ConfigStore, nodeId: string, address: string): long {
+    return store.put(PREFIX + nodeId, address);
+}
+
+pub fn remove(store: config.ConfigStore, nodeId: string): bool {
+    return store.del(PREFIX + nodeId);
+}
+
+pub fn isMember(store: config.ConfigStore, nodeId: string): bool {
+    return store.exists(PREFIX + nodeId);
+}
+
+pub fn count(store: config.ConfigStore): int {
+    return store.list(PREFIX).size();
+}
+
+// Member node ids (the "members/" prefix stripped), in store order.
+pub fn members(store: config.ConfigStore): list.List<string> {
+    let out = list.List<string>();
+    let entries = store.list(PREFIX);
+    let i = 0;
+    while (i < entries.size()) {
+        let e = entries.get(i) ?? config.ConfigEntry("", "", 0);
+        out.push(string.slice(e.key, string.len(PREFIX), string.len(e.key)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// The address registered for a member ("" if not a member).
+pub fn address(store: config.ConfigStore, nodeId: string): string {
+    let e = store.get(PREFIX + nodeId) ?? config.ConfigEntry("", "", 0);
+    return e.value;
+}
+
+// Quorum for the current membership (N/2 + 1). A cluster with fewer than quorum reachable members must NOT
+// elect a leader; callers gate election on `reachable >= quorum(store)` to prevent a minority split-brain.
+pub fn quorum(store: config.ConfigStore): int {
+    let n = count(store);
+    return n / 2 + 1;
+}

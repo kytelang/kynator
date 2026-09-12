@@ -1,0 +1,144 @@
+// net/netns.ky - Linux network-namespace + veth isolation for gateway-only workloads (the I3 Tier-2
+// tier that was deferred). The manifest's `network.expose: gateway-only` means an app must be reachable
+// ONLY through the gateway. On macOS/Windows that is achieved with fd-handoff (the app has no listening
+// socket); on Linux it is achieved HERE: each app runs in its own network namespace connected to the
+// host by a veth pair, so it is reachable only at its private veth address (which the gateway forwards
+// to) and never on the host's real interfaces.
+//
+// The setup is the standard container-networking recipe, driven through iproute2 (`ip`) rather than raw
+// netlink for this first cut (a pure-Kyte netlink path is a later, self-hosted step):
+//
+//   ip netns add kyte-<app>
+//   ip link add <hostIf> type veth peer name <appIf>
+//   ip link set <appIf> netns kyte-<app>
+//   ip addr add <hostIp>/30 dev <hostIf>   ;  ip link set <hostIf> up
+//   ip -n kyte-<app> addr add <appIp>/30 dev <appIf>
+//   ip -n kyte-<app> link set <appIf> up   ;  ip -n kyte-<app> link set lo up
+//   ip -n kyte-<app> route add default via <hostIp>          # app -> host (e.g. reach NovaDB)
+//
+// The app is then launched INSIDE the namespace via `ip netns exec kyte-<app> <binary> ...`, so it binds
+// its port on the private veth address, unreachable from anywhere but the gateway. Requires Linux + the
+// `ip` tool + CAP_NET_ADMIN (root); on any other platform, or without those, this is a no-op and the
+// caller falls back to fd-handoff / loopback. LIVE-VERIFIED ONLY ON LINUX (authored + command-tested on
+// macOS, where netns does not exist).
+import platform;
+import process;
+import io.file;
+import string;
+import list;
+
+// The addressing + names for one app's private network. Each app gets a /30 (host .1, app .2) in
+// 10.66.<idx>.0/30 - a point-to-point link between the host and the app namespace.
+pub struct NetPlan {
+    pub app: string,        // workload name
+    pub netns: string,      // "kyte-<app>"
+    pub hostIf: string,     // veth end in the host namespace ("nvh<idx>")
+    pub appIf: string,      // veth end inside the app namespace ("nva<idx>")
+    pub hostIp: string,     // host side address (gateway reaches the app THROUGH this link)
+    pub appIp: string,      // app side address (the app binds here; the gateway forwards here)
+    pub prefixLen: int,     // 30
+    init(app: string, netns: string, hostIf: string, appIf: string, hostIp: string, appIp: string) {
+        self.app = app;
+        self.netns = netns;
+        self.hostIf = hostIf;
+        self.appIf = appIf;
+        self.hostIp = hostIp;
+        self.appIp = appIp;
+        self.prefixLen = 30;
+    }
+}
+
+// Compute the plan for app `name` at node-unique slot `idx` (0..). Each REPLICA gets its own slot, so
+// its own namespace + /30 (replicas of one app can then all bind the same port on their private
+// address). Pure - no side effects, testable anywhere.
+pub fn plan(name: string, idx: int): NetPlan {
+    // Bound the address so a large slot index can never emit an invalid dotted-quad (the old
+    // `10.66.${idx}.` overflowed to 10.66.256.x past idx 255). idx is the third octet for idx 0..255
+    // (10.66.idx.1 / .2, unchanged); beyond that it spills into the second octet (10.67.x, 10.68.x, ...).
+    // Both octets are kept in 0..255 by construction, so the result is always a valid address; a fleet
+    // would exhaust the 10.66.0.0/16 space long before the modulo could wrap onto a live slot.
+    let slot = if (idx < 0) 0 else idx;
+    let o2 = 66 + ((slot / 256) % 190);   // 66..255
+    let o3 = slot % 256;                  // 0..255
+    let base = `10.${o2}.${o3}.`;
+    return NetPlan(name, `kyte-${name}-${idx}`, `nvh${idx}`, `nva${idx}`, base + "1", base + "2");
+}
+
+// Is Linux network-namespace isolation usable here? Linux + an `ip` binary on a standard path. (Root /
+// CAP_NET_ADMIN is also required to actually apply it; that surfaces as a non-zero exit from setup.)
+pub fn available(): bool {
+    if (!platform.isLinux) { return false; }
+    return file.File.exists("/sbin/ip") || file.File.exists("/usr/sbin/ip") || file.File.exists("/bin/ip");
+}
+
+// Build an argv list from a space-joined string (every `ip` token here is space-free: names, IPs, keywords).
+fn w(s: string): list.List<string> { return string.split(s, " "); }
+
+// The exact `ip` command sequence setup() runs, as a list of argv lists. Pure, so the recipe is unit
+// tested without touching the kernel. Each inner list is the args to `ip` (the program itself is "ip").
+pub fn setupCommands(p: NetPlan): list.List<list.List<string>> {
+    let cmds = list.List<list.List<string>>();
+    cmds.push(w(`netns add ${p.netns}`));
+    cmds.push(w(`link add ${p.hostIf} type veth peer name ${p.appIf}`));
+    cmds.push(w(`link set ${p.appIf} netns ${p.netns}`));
+    cmds.push(w(`addr add ${p.hostIp}/${p.prefixLen} dev ${p.hostIf}`));
+    cmds.push(w(`link set ${p.hostIf} up`));
+    cmds.push(w(`-n ${p.netns} addr add ${p.appIp}/${p.prefixLen} dev ${p.appIf}`));
+    cmds.push(w(`-n ${p.netns} link set ${p.appIf} up`));
+    cmds.push(w(`-n ${p.netns} link set lo up`));
+    cmds.push(w(`-n ${p.netns} route add default via ${p.hostIp}`));
+    return cmds;
+}
+
+// The teardown sequence: remove the host-side veth (which drops the pair) and delete the namespace.
+pub fn teardownCommands(p: NetPlan): list.List<list.List<string>> {
+    let cmds = list.List<list.List<string>>();
+    cmds.push(w(`link del ${p.hostIf}`));
+    cmds.push(w(`netns del ${p.netns}`));
+    return cmds;
+}
+
+// The argv prefix that runs a binary INSIDE the app namespace: `ip netns exec kyte-<app>`. The supervisor
+// prepends this to the workload command so the process binds its port on the private veth address. Pure.
+pub fn execPrefix(p: NetPlan): list.List<string> {
+    return w(`netns exec ${p.netns}`);
+}
+
+// Build the (cmd, args) to spawn `binary`+`args` inside the namespace: run "ip" with
+// ["netns","exec",netns, binary, ...args]. Returns the args list; the command to spawn is "ip".
+pub fn wrapExec(p: NetPlan, binary: string, args: list.List<string>): list.List<string> {
+    let out = execPrefix(p);
+    out.push(binary);
+    let i = 0;
+    while (i < args.size()) { out.push(args.get(i) ?? ""); i = i + 1; }
+    return out;
+}
+
+fn runIp(args: list.List<string>): int {
+    let pr = process.Process.spawn("ip", args);
+    return pr.wait();
+}
+
+// Create the namespace + veth link for `p`. Best-effort: a no-op returning -1 when netns isolation is not
+// available (non-Linux, no `ip`), else runs the setup sequence and returns 0 on success or the first
+// non-zero `ip` exit code. Idempotency / cleanup of a stale namespace is the caller's (teardown first).
+pub fn setup(p: NetPlan): int {
+    if (!available()) { return -1; }
+    let cmds = setupCommands(p);
+    let i = 0;
+    while (i < cmds.size()) {
+        let rc = runIp(cmds.get(i) ?? list.List<string>());
+        if (rc != 0) { return rc; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Remove the veth + namespace. Best-effort; ignores individual failures (teardown should be idempotent).
+pub fn teardown(p: NetPlan): int {
+    if (!available()) { return -1; }
+    let cmds = teardownCommands(p);
+    let i = 0;
+    while (i < cmds.size()) { let _ = runIp(cmds.get(i) ?? list.List<string>()); i = i + 1; }
+    return 0;
+}

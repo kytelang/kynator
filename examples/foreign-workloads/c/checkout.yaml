@@ -1,0 +1,19 @@
+apiVersion: kyte/v1
+kind: App
+metadata:
+  name: checkout-c
+workload:
+  workloadType: foreign      # supervise a non-Kyte binary
+  binary: ./c/app            # built by ../build.sh; give an absolute path for a real deploy
+  restartPolicy: always
+  portEnv: PORT              # the C server reads $PORT
+  env:
+    - FOO=c-env
+replicas:
+  min: 2
+  max: 2
+network:
+  expose: gateway-only
+  portBase: 18090            # replica i binds 18090 + i; the gateway byte-forwards to it
+health:
+  probeType: tcp             # a bare TCP connect = healthy (the binary need not expose /healthz)

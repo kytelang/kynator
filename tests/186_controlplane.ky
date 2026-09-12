@@ -1,0 +1,157 @@
+// 186 - the control-plane model behind the web dashboard (orch/controlplane): deploy validates + stores
+// a manifest; the registry lists apps; status summarises one; and the JSON + HTML renderers produce the
+// API / dashboard output. All sync + in-memory, so it is verified without a live server or DB.
+import assert;
+import string;
+import orch.controlplane;
+import orch.manifest;
+import list;
+
+fn appYaml(name: string, min: int, max: int): string {
+    return `metadata:\n  name: ${name}\n` +
+           `workload:\n  binary: /bin/${name}\n` +
+           `replicas:\n  min: ${min}\n  max: ${max}\n` +
+           "autoscale:\n  enabled: true\n  metric: inflight\n  target: 8\n" +
+           "lb:\n  strategy: leastconn\n" +
+           "routes:\n  - /api/x\n  - /api/y\n";
+}
+
+@test
+fn test_deploy_and_list(): void {
+    let r = controlplane.Registry();
+    assert.equalStr(r.deploy(appYaml("shop", 2, 5)), "");   // "" = accepted
+    assert.equalStr(r.deploy(appYaml("api", 1, 3)), "");
+    assert.equalInt(r.count(), 2);
+    assert.isTrue(r.has("shop"));
+    assert.isTrue(r.has("api"));
+    assert.isTrue(!r.has("missing"));
+}
+
+@test
+fn test_status_read_model(): void {
+    let r = controlplane.Registry();
+    let _ = r.deploy(appYaml("shop", 2, 5));
+    let s = r.status("shop");
+    assert.equalStr(s.name, "shop");
+    assert.equalInt(s.minReplicas, 2);
+    assert.equalInt(s.maxReplicas, 5);
+    assert.isTrue(s.autoscale);
+    assert.equalStr(s.metric, "inflight");
+    assert.equalStr(s.lb, "leastconn");
+    assert.equalInt(s.routes, 2);
+    // isolation is platform-selected (handoff on mac, netns/loopback on linux) - just non-empty.
+    assert.isTrue(!string.eql(s.isolation, ""));
+}
+
+@test
+fn test_deploy_rejects_invalid_manifest(): void {
+    let r = controlplane.Registry();
+    let err = r.deploy("workload:\n  binary: /b\n");        // no metadata.name
+    assert.isTrue(!string.eql(err, ""));
+    assert.isTrue(string.contains(err, "name"));
+    assert.equalInt(r.count(), 0);                           // nothing stored on rejection
+}
+
+@test
+fn test_deploy_updates_existing(): void {
+    let r = controlplane.Registry();
+    let _ = r.deploy(appYaml("shop", 2, 5));
+    let _2 = r.deploy(appYaml("shop", 3, 9));                // same name -> update
+    assert.equalInt(r.count(), 1);
+    assert.equalInt(r.status("shop").maxReplicas, 9);
+}
+
+@test
+fn test_apps_json(): void {
+    let r = controlplane.Registry();
+    let _ = r.deploy(appYaml("shop", 2, 5));
+    let j = controlplane.appsJson(r);
+    assert.isTrue(string.contains(j, "\"name\":\"shop\""));
+    assert.isTrue(string.contains(j, "\"lb\":\"leastconn\""));
+    assert.isTrue(string.contains(j, "\"maxReplicas\":5"));
+    // one app -> a single-element array
+    assert.isTrue(string.startsWith(j, "[") && string.endsWith(j, "]"));
+    // unknown app -> error object
+    assert.isTrue(string.contains(controlplane.appJson(r, "nope"), "not found"));
+}
+
+@test
+fn test_dashboard_html(): void {
+    let r = controlplane.Registry();
+    let _ = r.deploy(appYaml("shop", 2, 5));
+    let h = controlplane.dashboardHtml(r);
+    assert.isTrue(string.contains(h, "Kyte control plane"));
+    assert.isTrue(string.contains(h, "1 app(s) deployed"));
+    assert.isTrue(string.contains(h, "shop"));
+    assert.isTrue(string.contains(h, "2-5"));                // replica band cell
+    assert.isTrue(string.contains(h, "leastconn"));
+}
+
+@test
+fn test_apps_fragment_for_datastar(): void {
+    let r = controlplane.Registry();
+    let _ = r.deploy(appYaml("shop", 2, 5));
+    let f = controlplane.appsFragment(r);
+    assert.isTrue(string.startsWith(f, "<div id=\"apps\">"));   // patch target
+    assert.isTrue(string.contains(f, "shop"));
+    assert.isTrue(string.contains(f, "2-5"));
+    assert.isTrue(!string.contains(f, "\n"));                    // single line -> one SSE data line
+}
+
+// statusOf reads a status straight from manifest YAML (the store-backed control-plane path), matching
+// what the in-memory Registry produces from the same manifest.
+@test
+fn test_status_of_yaml(): void {
+    let s = controlplane.statusOf(appYaml("shop", 2, 5));
+    assert.equalStr(s.name, "shop");
+    assert.equalInt(s.minReplicas, 2);
+    assert.equalInt(s.maxReplicas, 5);
+    assert.isTrue(s.autoscale);
+    assert.equalStr(s.lb, "leastconn");
+    assert.equalInt(s.routes, 2);
+}
+
+// appsFragmentFrom renders a plain status list into the same #apps block appsFragment produces.
+@test
+fn test_apps_fragment_from_list(): void {
+    let ss = list.List<controlplane.AppStatus>();
+    ss.push(controlplane.statusOf(appYaml("shop", 2, 5)));
+    ss.push(controlplane.statusOf(appYaml("api", 1, 3)));
+    let f = controlplane.appsFragmentFrom(ss);
+    assert.isTrue(string.startsWith(f, "<div id=\"apps\">"));
+    assert.isTrue(string.contains(f, "2 app(s) deployed"));
+    assert.isTrue(string.contains(f, "shop") && string.contains(f, "api"));
+    assert.isTrue(!string.contains(f, "\n"));
+}
+
+// manifest.toYaml round-trips through parseManifest for every behaviour-bearing field -- the property the
+// control plane relies on to canonicalise a deploy and to rewrite replicas on a scale without losing the
+// rest of the manifest.
+@test
+fn test_manifest_toyaml_roundtrip(): void {
+    let m = manifest.parseManifest(appYaml("shop", 2, 5));
+    let back = manifest.parseManifest(manifest.toYaml(m));
+    assert.equalStr(back.metadata.name, "shop");
+    assert.equalStr(back.workload.binary, "/bin/shop");
+    assert.equalInt(back.replicas.min, 2);
+    assert.equalInt(back.replicas.max, 5);
+    assert.isTrue(back.autoscale.enabled);
+    assert.equalStr(back.autoscale.metric, "inflight");
+    assert.equalStr(back.lb.strategy, "leastconn");
+    assert.equalInt(back.routes.size(), 2);
+    assert.equalStr(manifest.validateManifest(back), "");   // still valid after the round-trip
+}
+
+// The scale rewrite: parse -> change replicas -> toYaml -> reparse yields the new band, everything else
+// intact. This is exactly what a browser control plane would do when an operator scales an app.
+@test
+fn test_manifest_scale_rewrite(): void {
+    let m = manifest.parseManifest(appYaml("shop", 2, 5));
+    m.replicas.min = 4;
+    m.replicas.max = 10;
+    let scaled = manifest.parseManifest(manifest.toYaml(m));
+    assert.equalInt(scaled.replicas.min, 4);
+    assert.equalInt(scaled.replicas.max, 10);
+    assert.equalStr(scaled.workload.binary, "/bin/shop");   // unchanged
+    assert.equalStr(scaled.lb.strategy, "leastconn");       // unchanged
+}

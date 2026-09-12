@@ -1,0 +1,67 @@
+// 210 -- the LOCKED env shape (ROADMAP-1.0 Tier 2 "env shape decision"). `workload.env` is an ARRAY of
+// "KEY=VALUE" strings; the YAML MAP form is rejected with a clear error, and a valid array round-trips
+// through parse -> validate -> toSpec -> the spawn env list.
+import assert;
+import orch.manifest;
+import orch.spec;
+import string;
+
+const BASE: string = "apiVersion: kyte/v1\nkind: App\nmetadata: { name: envt }\n";
+
+fn wl(envblock: string): string {
+    return BASE + "workload:\n  binary: /bin/x\n" + envblock + "replicas: { min: 1, max: 1 }\nnetwork: { expose: gateway-only }\n";
+}
+
+@test
+fn array_form_parses_validates_and_reaches_spec(): void {
+    let m = manifest.parseManifest(wl("  env: [ \"PORT=8080\", \"LOG=info\" ]\n"));
+    assert.equalStr(manifest.validateManifest(m), "");           // valid
+    let s = manifest.toSpec(m);
+    assert.equalInt(s.env.size(), 2);
+    assert.isTrue(string.eql(s.env.get(0) ?? "", "PORT=8080"));  // carried through to the spawn env
+    assert.isTrue(string.eql(s.env.get(1) ?? "", "LOG=info"));
+}
+
+@test
+fn block_sequence_form_is_accepted(): void {
+    let m = manifest.parseManifest(wl("  env:\n    - \"A=1\"\n    - \"B=2\"\n"));
+    assert.equalStr(manifest.validateManifest(m), "");
+    assert.equalInt(manifest.toSpec(m).env.size(), 2);
+}
+
+@test
+fn inline_map_form_is_rejected(): void {
+    let m = manifest.parseManifest(wl("  env: { PORT: 8080 }\n"));
+    let err = manifest.validateManifest(m);
+    assert.isTrue(!string.eql(err, ""));                         // rejected, not silently empty
+    assert.isTrue(string.contains(err, "must be an array"));     // clear message
+}
+
+@test
+fn block_map_form_is_rejected(): void {
+    let m = manifest.parseManifest(wl("  env:\n    PORT: 8080\n    LOG: info\n"));
+    let err = manifest.validateManifest(m);
+    assert.isTrue(!string.eql(err, ""));
+    assert.isTrue(string.contains(err, "must be an array"));
+}
+
+@test
+fn malformed_array_entry_is_rejected(): void {
+    // an entry without "=" is not a KEY=VALUE pair -> clear error naming the index.
+    let m = manifest.parseManifest(wl("  env: [ \"NOEQUALS\" ]\n"));
+    let err = manifest.validateManifest(m);
+    assert.isTrue(string.contains(err, "KEY=VALUE"));
+}
+
+@test
+fn empty_key_entry_is_rejected(): void {
+    let m = manifest.parseManifest(wl("  env: [ \"=novalue\" ]\n"));
+    assert.isTrue(!string.eql(manifest.validateManifest(m), ""));
+}
+
+@test
+fn no_env_is_fine(): void {
+    let m = manifest.parseManifest(wl(""));
+    assert.equalStr(manifest.validateManifest(m), "");
+    assert.equalInt(manifest.toSpec(m).env.size(), 0);
+}

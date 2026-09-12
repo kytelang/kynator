@@ -1,0 +1,78 @@
+// 212 -- observability the operator can act on (ROADMAP-1.0 Tier 2). Scrape the rendered /metrics text and
+// prove the per-workload series (desired, running, restarts, probe-failures, rollout-state) plus the
+// under-provisioned gauge MOVE as the fleet's state changes: a crash loop bumps restarts, a lost replica
+// shows under-provisioned + a lower running, a failing heal probe shows probe-failures, and a rolling
+// upgrade shows the rolling flag. Simulated supervisors so the transitions are deterministic.
+import assert;
+import string;
+import list;
+import orch.nativelet;
+import orch.spec;
+import orch.supervisor;
+import orch.health;
+
+fn metricsOf(n: nativelet.Nativelet): string {
+    return health.renderMetrics(health.standaloneReport(n), n.status());
+}
+
+fn hasLine(text: string, line: string): bool { return string.contains(text, line); }
+
+fn oneWorkload(n: nativelet.Nativelet, reps: int): void {
+    let d = list.List<spec.Spec>();
+    d.push(spec.parseSpec("{\"name\":\"web\",\"binaryPath\":\"/bin/web\",\"replicas\":" + reps + ",\"restartPolicy\":\"always\"}"));
+    n.reconcileWith(d);
+}
+
+@test
+fn all_per_workload_series_are_present(): void {
+    let n = nativelet.Nativelet("unused");
+    n.simulated = true;
+    oneWorkload(n, 2);
+    let m = metricsOf(n);
+    // desired/running/restarts/probe-failures/rolling all emitted for the workload.
+    assert.isTrue(hasLine(m, "orch_workload_desired{workload=\"web\"} 2"));
+    assert.isTrue(hasLine(m, "orch_workload_running{workload=\"web\"} 2"));
+    assert.isTrue(hasLine(m, "orch_workload_restarts{workload=\"web\"} 0"));
+    assert.isTrue(hasLine(m, "orch_workload_probe_failures{workload=\"web\"} 0"));
+    assert.isTrue(hasLine(m, "orch_workload_rolling{workload=\"web\"} 0"));
+    assert.isTrue(hasLine(m, "orch_under_provisioned 0"));
+}
+
+@test
+fn losing_a_replica_moves_running_and_under_provisioned(): void {
+    let n = nativelet.Nativelet("unused");
+    n.simulated = true;
+    oneWorkload(n, 2);
+    // crash one replica but DO NOT reap yet -> running 1 < desired 2.
+    (n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.simCrash(1, 1);
+    let m = metricsOf(n);
+    assert.isTrue(hasLine(m, "orch_workload_running{workload=\"web\"} 1"));
+    assert.isTrue(hasLine(m, "orch_under_provisioned 1"));
+}
+
+@test
+fn crash_loop_moves_restarts(): void {
+    let n = nativelet.Nativelet("unused");
+    n.simulated = true;
+    oneWorkload(n, 2);
+    assert.isTrue(hasLine(metricsOf(n), "orch_workload_restarts{workload=\"web\"} 0"));
+    // crash 2, then reap+restart (restartPolicy always) via pollAll -> restarts == 2, running back to 2.
+    (n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.simCrash(2, 1);
+    n.pollAll();
+    let m = metricsOf(n);
+    assert.isTrue(hasLine(m, "orch_workload_restarts{workload=\"web\"} 2"));
+    assert.isTrue(hasLine(m, "orch_workload_running{workload=\"web\"} 2"));
+}
+
+@test
+fn probe_failures_and_rolling_move(): void {
+    let n = nativelet.Nativelet("unused");
+    n.simulated = true;
+    oneWorkload(n, 2);
+    let job = n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+    job.probeFails = 2;
+    job.rolling = true;
+    let m = metricsOf(n);
+    assert.isTrue(hasLine(m, "orch_workload_probe_failures{workload=\"web\"} 2"));
+    assert.isTrue(hasLine(m, "orch_workload_rolling{workload=\"web\"} 1"));
+}

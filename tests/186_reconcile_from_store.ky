@@ -1,0 +1,77 @@
+// 186 -- store-driven reconcile (config-store P1): the nativelet converges toward desired state read from
+// the config store (list("workloads/")) instead of the manifest directory. Exercised in memory with
+// manageProcesses=false: put/update/delete workload specs in a ConfigStore, feed each snapshot through
+// reconcileFromEntries, and assert the diff (start new / replace changed / drop removed / stop all). The
+// store is the source of truth; the manifest dir is now just an optional bootstrap importer.
+import assert;
+import list;
+import string;
+import store.config;
+import orch.nativelet;
+import orch.spec;
+
+// A minimal workload Spec as JSON (what a `workloads/<name>` value holds in the store).
+fn specJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name + "\",\"replicas\":" + reps + "}";
+}
+
+@test
+fn test_reconcile_from_store(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;                       // reconcile logic only; no real spawns
+
+    // Desired state lives in the store under workloads/.
+    let _1 = store.put("workloads/web", specJson("web", 2));
+    let _2 = store.put("workloads/api", specJson("api", 1));
+
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 2);
+    assert.isTrue(n.findJobIdx("web") >= 0);
+    assert.isTrue(n.findJobIdx("api") >= 0);
+    assert.equalInt(n.desiredReplicas("web"), 2);
+
+    // A spec CHANGE in the store (replicas 2 -> 3) replaces the running job on the next reconcile.
+    let _3 = store.put("workloads/web", specJson("web", 3));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 2);
+    assert.equalInt(n.desiredReplicas("web"), 3);    // replaced with the new spec
+    assert.equalInt(n.desiredReplicas("api"), 1);    // untouched
+
+    // DELETING a key from the store drops that workload on the next reconcile.
+    let _4 = store.del("workloads/api");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);
+    assert.isTrue(n.findJobIdx("api") < 0);
+    assert.isTrue(n.findJobIdx("web") >= 0);
+
+    // Prefix isolation: a key OUTSIDE workloads/ (e.g. the leader lease) never becomes a workload.
+    let _5 = store.put("leases/leader", "node-1");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);               // still just web; leases/ ignored
+    assert.isTrue(n.findJobIdx("leader") < 0);
+
+    // An empty store snapshot stops everything (explicit "no desired state").
+    let _6 = store.del("workloads/web");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 0);
+}
+
+// An empty value under the prefix is treated like an unreadable manifest: a running workload is KEPT, not
+// torn down (a half-written config should not stop a healthy service).
+@test
+fn test_reconcile_empty_value_keeps_running(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+
+    let _1 = store.put("workloads/web", specJson("web", 1));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);
+
+    // Overwrite with an empty value (a transient/half-written config). reconcile must KEEP web.
+    let _2 = store.put("workloads/web", "");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);
+    assert.isTrue(n.findJobIdx("web") >= 0);
+}

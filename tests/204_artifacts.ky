@@ -1,0 +1,224 @@
+// Content-addressed artifact store + blob service + pull-cache verification. All offline: the store uses
+// a temp dir, the service is driven via app.dispatch, and the pull cache is fed in-memory bytes.
+import assert;
+import string;
+import list;
+import process;
+import crypto.hash.sha;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import artifacts.blobstore;
+import artifacts.registry;
+import artifacts.service;
+import orch.artifact;
+
+fn tmpRoot(): string { return "/tmp/kyte_artifacts_test"; }
+
+// The blob roots below are fixed paths, and the negative assertions ("a denied/rejected write stored
+// NOTHING") assume an empty starting tree. run-tests.sh does not clean between runs, so wipe the tree
+// once up front to keep every case hermetic across repeated suite runs.
+fn resetRoot(): void {
+    let args = list.List<string>();
+    args.push("-rf");
+    args.push(tmpRoot());
+    let p = process.Process.spawn("/bin/rm", args);
+    p.wait();
+}
+
+fn req(method: string, path: string, headers: string, body: string): request.Request {
+    let raw = method + " " + path + " HTTP/1.1\r\nHost: x\r\n" + headers
+        + "Content-Length: " + `${body.length}` + "\r\n\r\n" + body;
+    return request.Request.fromString(raw);
+}
+
+@test
+fn test_put_verifies_and_roundtrips(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/a");
+    let data = "\x7fELF...pretend binary...\x00\x01\x02";     // arbitrary bytes, binary-safe
+    let digest = sha.sha256(data);
+    assert.isTrue(store.put(digest, data));                    // stored + verified
+    assert.isTrue(store.has(digest));
+    assert.equalStr(store.get(digest) ?? "", data);            // exact byte round-trip
+    assert.isTrue(store.put(digest, data));                    // idempotent re-put
+}
+
+@test
+fn test_put_rejects_hash_mismatch(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/b");
+    let data = "some bytes";
+    let wrongSha = sha.sha256("different bytes");              // a valid sha, but not of `data`
+    assert.isTrue(!store.put(wrongSha, data));                 // integrity gate rejects it
+    assert.isTrue(!store.has(wrongSha));                       // nothing was published
+}
+
+@test
+fn test_rejects_malformed_sha(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/c");
+    assert.isTrue(!store.validSha("../etc/passwd"));           // path-traversal name refused
+    assert.isTrue(!store.validSha("abc"));                     // too short
+    assert.isTrue(!store.put("../../evil", "x"));
+}
+
+@test
+fn test_service_upload_download_and_auth(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/svc/blobs");
+    let reg = registry.Registry(tmpRoot() + "/svc/apps", store);
+    let app = service.buildArtifactService(store, reg, "sekret");
+    let data = "binary\x00\x01contents";
+    let digest = sha.sha256(data);
+    let auth = "authorization: Bearer sekret\r\n";
+
+    // No token -> 401, and nothing stored.
+    let denied = app.dispatch(req("PUT", "/artifacts/" + digest, "", data));
+    assert.equalInt(denied.status.toCode(), 401);
+    assert.isTrue(!store.has(digest));
+
+    // Authed PUT -> 201; re-PUT -> 200 exists.
+    let created = app.dispatch(req("PUT", "/artifacts/" + digest, auth, data));
+    assert.equalInt(created.status.toCode(), 201);
+    assert.equalInt(app.dispatch(req("PUT", "/artifacts/" + digest, auth, data)).status.toCode(), 200);
+
+    // Exists probe (CI's skip-upload check).
+    assert.equalInt(app.dispatch(req("GET", "/artifacts/" + digest + "/exists", auth, "")).status.toCode(), 200);
+    let miss = sha.sha256("nope");
+    assert.equalInt(app.dispatch(req("GET", "/artifacts/" + miss + "/exists", auth, "")).status.toCode(), 404);
+
+    // GET returns the exact bytes.
+    let got = app.dispatch(req("GET", "/artifacts/" + digest, auth, ""));
+    assert.equalInt(got.status.toCode(), 200);
+    assert.equalStr(got.body, data);
+}
+
+@test
+fn test_service_rejects_content_that_does_not_match_sha(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/svc2/blobs");
+    let reg = registry.Registry(tmpRoot() + "/svc2/apps", store);
+    let app = service.buildArtifactService(store, reg, "");   // auth disabled for this check
+    let claimed = sha.sha256("the real bytes");
+    // Upload DIFFERENT bytes under a valid-but-wrong sha -> 409, nothing stored.
+    let r = app.dispatch(req("PUT", "/artifacts/" + claimed, "", "tampered bytes"));
+    assert.equalInt(r.status.toCode(), 409);
+    assert.isTrue(!store.has(claimed));
+}
+
+@test
+fn test_resolve_binary_legacy_and_content_addressed(): void {
+    resetRoot();
+    let cache = blobstore.BlobStore(tmpRoot() + "/cache");
+    // Legacy: no artifact -> binaryPath used verbatim.
+    assert.equalStr(artifact.resolveBinary("", "/opt/app/bin", cache) catch (e) "ERR", "/opt/app/bin");
+
+    let data = "the deployable binary bytes";
+    let digest = sha.sha256(data);
+    let ref = "sha256:" + digest;
+
+    // Content-addressed but not yet cached -> NotCached (the caller would pull, then retry).
+    assert.equalStr(artifact.resolveBinary(ref, "", cache) catch (e) "NOTCACHED", "NOTCACHED");
+
+    // Cache the (verified) bytes, then resolution yields the local path.
+    let path = artifact.cacheArtifact(cache, digest, data) catch (e) "ERR";
+    assert.equalStr(path, cache.localPath(digest));
+    assert.equalStr(artifact.resolveBinary(ref, "", cache) catch (e) "ERR", cache.localPath(digest));
+}
+
+@test
+fn test_cache_artifact_rejects_corrupt_download(): void {
+    resetRoot();
+    let cache = blobstore.BlobStore(tmpRoot() + "/cache2");
+    let claimed = sha.sha256("intended bytes");
+    // A tampered/corrupt download under a valid sha is refused -> never becomes runnable.
+    assert.equalStr(artifact.cacheArtifact(cache, claimed, "corrupted!") catch (e) "REJECTED", "REJECTED");
+    assert.isTrue(!cache.has(claimed));
+}
+
+// ---- namespace layer (app/version -> digest) ------------------------------------------------------
+
+@test
+fn test_registry_bind_resolve_versions_and_promote(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/reg/blobs");
+    let reg = registry.Registry(tmpRoot() + "/reg/apps", store);
+
+    let v1 = "the shop v1 binary";
+    let d1 = sha.sha256(v1);
+    let v2 = "the shop v2 binary";
+    let d2 = sha.sha256(v2);
+
+    // Binding before the content exists is refused (name can never point at absent bytes).
+    assert.equalStr(reg.bind("shop", "1.0.0", "sha256:" + d1), "blob not uploaded");
+
+    // Upload content, then name it. Idempotent re-bind of the SAME digest succeeds.
+    assert.isTrue(store.put(d1, v1));
+    assert.equalStr(reg.bind("shop", "1.0.0", "sha256:" + d1), "");
+    assert.equalStr(reg.bind("shop", "1.0.0", "sha256:" + d1), "");
+    assert.equalStr(reg.resolve("shop", "1.0.0") ?? "", "sha256:" + d1);
+    assert.equalStr(reg.binary("shop", "1.0.0") ?? "", v1);      // resolves to verified bytes
+
+    // Versions are immutable: re-binding a DIFFERENT digest to 1.0.0 is refused.
+    assert.isTrue(store.put(d2, v2));
+    assert.equalStr(reg.bind("shop", "1.0.0", "sha256:" + d2), "version already bound to a different digest");
+    assert.equalStr(reg.bind("shop", "2.0.0", "sha256:" + d2), "");   // a NEW version is fine
+
+    // Promotion (the rollout/rollback lever): current must name a bound version.
+    assert.equalStr(reg.promote("shop", "9.9.9"), "no such version");
+    assert.equalStr(reg.promote("shop", "2.0.0"), "");
+    assert.equalStr(reg.current("shop") ?? "", "2.0.0");
+    assert.equalStr(reg.promote("shop", "1.0.0"), "");               // roll back
+    assert.equalStr(reg.current("shop") ?? "", "1.0.0");
+
+    assert.equalInt(reg.versions("shop").size(), 2);                 // 1.0.0 + 2.0.0, "current" excluded
+}
+
+@test
+fn test_registry_rejects_bad_and_reserved_names(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/reg2/blobs");
+    let reg = registry.Registry(tmpRoot() + "/reg2/apps", store);
+    let data = "x";
+    let d = sha.sha256(data);
+    assert.isTrue(store.put(d, data));
+    assert.isTrue(!reg.validName("../etc"));                         // traversal
+    assert.isTrue(!reg.validName(".hidden"));                       // leading dot
+    assert.isTrue(!reg.validName("a/b"));                           // separator
+    assert.equalStr(reg.bind("shop", "current", "sha256:" + d), "'current' is reserved");
+    assert.isTrue(reg.resolve("nope", "1.0.0") == undefined);       // unknown app/version
+}
+
+@test
+fn test_service_namespace_flow(): void {
+    resetRoot();
+    let store = blobstore.BlobStore(tmpRoot() + "/nsvc/blobs");
+    let reg = registry.Registry(tmpRoot() + "/nsvc/apps", store);
+    let app = service.buildArtifactService(store, reg, "");
+    let data = "deployable\x00bytes";
+    let digest = sha.sha256(data);
+
+    // Content first, then name it.
+    assert.equalInt(app.dispatch(req("PUT", "/artifacts/" + digest, "", data)).status.toCode(), 201);
+    assert.equalInt(app.dispatch(req("PUT", "/apps/shop/1.2.0", "", "sha256:" + digest)).status.toCode(), 201);
+
+    // Resolve tag -> digest, and tag -> the exact bytes.
+    let dg = app.dispatch(req("GET", "/apps/shop/1.2.0/digest", "", ""));
+    assert.equalInt(dg.status.toCode(), 200);
+    assert.equalStr(dg.body, "sha256:" + digest);
+    let bin = app.dispatch(req("GET", "/apps/shop/1.2.0", "", ""));
+    assert.equalInt(bin.status.toCode(), 200);
+    assert.equalStr(bin.body, data);
+
+    // Naming bytes that were never uploaded -> 404.
+    let miss = sha.sha256("never uploaded");
+    assert.equalInt(app.dispatch(req("PUT", "/apps/shop/9.9.9", "", "sha256:" + miss)).status.toCode(), 404);
+
+    // Promote, then the listing reports it.
+    assert.equalInt(app.dispatch(req("POST", "/apps/shop/promote", "", "1.2.0")).status.toCode(), 200);
+    let ls = app.dispatch(req("GET", "/apps/shop", "", ""));
+    assert.equalInt(ls.status.toCode(), 200);
+    assert.equalInt(app.dispatch(req("GET", "/apps/ghost", "", "")).status.toCode(), 404);
+}

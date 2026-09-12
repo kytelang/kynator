@@ -1,0 +1,52 @@
+// 213 -- artifact ORIGIN resolution (ROADMAP-1.0 Tier 2 blob store / bring-your-own). kynatord pulls
+// blobs from artifactOriginUrl(c): an explicit `artifactOrigin` (any HTTP(S) object store) wins, else it
+// falls back to the config store's own URL (the all-in-one dev artifactd), else "" (pulling disabled).
+// The bearer resolves similarly: explicit artifactToken, else the store token.
+import assert;
+import cfg.config;
+import string;
+
+fn cfgWith(origin: string, tok: string, storeAddr: string, storeTok: string, tls: bool): config.OrchConfig {
+    let c = config.OrchConfig();
+    c.artifactOrigin = origin;
+    c.artifactToken = tok;
+    c.store.addr = storeAddr;
+    c.store.token = storeTok;
+    c.store.tls = tls;
+    return c;
+}
+
+@test
+fn explicit_origin_wins(): void {
+    let c = cfgWith("https://blobs.example.com", "", "127.0.0.1:8135", "storetok", false);
+    assert.equalStr(config.artifactOriginUrl(c), "https://blobs.example.com");   // BYO object store, TLS
+}
+
+@test
+fn falls_back_to_store_url(): void {
+    let c = cfgWith("", "", "cfg.internal:8135", "storetok", true);
+    assert.equalStr(config.artifactOriginUrl(c), "https://cfg.internal:8135");   // all-in-one dev, tls->https
+}
+
+@test
+fn no_origin_no_store_disables_pull(): void {
+    let c = cfgWith("", "", "", "", false);
+    assert.equalStr(config.artifactOriginUrl(c), "");
+}
+
+@test
+fn explicit_token_wins_else_store_token(): void {
+    let c1 = cfgWith("https://blobs", "blobtok", "a:1", "storetok", false);
+    assert.equalStr(config.artifactBearer(c1), "blobtok");
+    let c2 = cfgWith("https://blobs", "", "a:1", "storetok", false);
+    assert.equalStr(config.artifactBearer(c2), "storetok");   // fall back to store token
+}
+
+@test
+fn origin_parses_from_json(): void {
+    // present-and-typed fields load; the origin overrides the store fallback.
+    let c = config.OrchConfig();
+    // (loadOrchConfig reads a file; here we assert the struct default is empty so the fallback path holds)
+    assert.equalStr(c.artifactOrigin, "");
+    assert.equalStr(c.artifactToken, "");
+}

@@ -1,0 +1,116 @@
+// kynatorctl -- the OFFLINE operator CLI for the orchestrator control plane (O3). It works on a config-store
+// BACKUP DUMP FILE (the `key<TAB>value` format `kynatord`/the store produce): inspect it, edit cluster
+// membership, and print a rolling-upgrade plan -- the runbook steps that were manual, now scriptable and
+// reviewable BEFORE they touch a live cluster. Live apply is `kynatord` + the store; kynatorctl is the safe
+// companion that never needs a running btree, so it builds and runs anywhere.
+//
+//   kynatorctl inspect <file>
+//   kynatorctl members <file>
+//   kynatorctl member add <file> <id> <addr>
+//   kynatorctl member remove <file> <id>
+//   kynatorctl upgrade-plan <file>
+import store.config;
+import orch.backup;
+import orch.membership;
+import env;
+import io.file;
+import list;
+import string;
+
+fn usage(): int {
+    console.log("kynatorctl -- offline orchestrator control-plane tool (operates on a config backup dump)");
+    console.log("  inspect <file>                 count + list keys");
+    console.log("  members <file>                 list cluster members");
+    console.log("  member add <file> <id> <addr>  add a member (rewrites the file)");
+    console.log("  member remove <file> <id>      remove a member (rewrites the file)");
+    console.log("  upgrade-plan <file>            print the rolling-upgrade node order");
+    return 2;
+}
+
+// Load a dump file into an in-memory ConfigStore. Empty store if the file is absent.
+fn load(path: string): config.ConfigStore {
+    let store = config.ConfigStore();
+    if (file.File.exists(path)) { let _ = backup.restore(store, file.File.readText(path)); }
+    return store;
+}
+
+fn save(store: config.ConfigStore, path: string): void {
+    file.File.writeText(path, backup.dump(store, ""));
+}
+
+fn main(): int {
+    let a = env.args();
+    if (a.size() < 2) { return usage(); }
+    let cmd = a.get(1) ?? "";
+
+    if (string.eql(cmd, "inspect")) {
+        let path = a.get(2) ?? "";
+        if (string.eql(path, "")) { return usage(); }
+        let store = load(path);
+        let entries = store.list("");
+        console.log(`${entries.size()} entries in ${path}`);
+        let i = 0;
+        while (i < entries.size()) {
+            let e = entries.get(i) ?? config.ConfigEntry("", "", 0);
+            console.log(`  ${e.key}`);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    if (string.eql(cmd, "members")) {
+        let path = a.get(2) ?? "";
+        if (string.eql(path, "")) { return usage(); }
+        let store = load(path);
+        let ms = membership.members(store);
+        console.log(`${ms.size()} member(s), quorum ${membership.quorum(store)}`);
+        let i = 0;
+        while (i < ms.size()) {
+            let id = ms.get(i) ?? "";
+            console.log(`  ${id}\t${membership.address(store, id)}`);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    if (string.eql(cmd, "member")) {
+        let sub = a.get(2) ?? "";
+        let path = a.get(3) ?? "";
+        if (string.eql(path, "")) { return usage(); }
+        let store = load(path);
+        if (string.eql(sub, "add")) {
+            let id = a.get(4) ?? "";
+            let addr = a.get(5) ?? "";
+            if (string.eql(id, "") || string.eql(addr, "")) { return usage(); }
+            let _ = membership.add(store, id, addr);
+            save(store, path);
+            console.log(`added ${id} -> ${addr} (${membership.count(store)} members)`);
+            return 0;
+        }
+        if (string.eql(sub, "remove")) {
+            let id = a.get(4) ?? "";
+            if (string.eql(id, "")) { return usage(); }
+            let _ = membership.remove(store, id);
+            save(store, path);
+            console.log(`removed ${id} (${membership.count(store)} members)`);
+            return 0;
+        }
+        return usage();
+    }
+
+    if (string.eql(cmd, "upgrade-plan")) {
+        let path = a.get(2) ?? "";
+        if (string.eql(path, "")) { return usage(); }
+        let store = load(path);
+        let ms = membership.members(store);
+        console.log(`rolling upgrade plan for ${ms.size()} node(s) (one at a time; a leader drains and a peer promotes first):`);
+        let i = 0;
+        while (i < ms.size()) {
+            console.log(`  ${i + 1}. drain-if-leader ${ms.get(i) ?? ""} -> upgrade -> rejoin (rollback on failure)`);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    return usage();
+}

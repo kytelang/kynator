@@ -1,0 +1,80 @@
+// 191 -- P4 rollout safety: a bad spec update must NOT take down a healthy workload. reconcileFromEntries
+// now parses THEN validates each store value (spec.validateSpec); a spec that parses but is semantically
+// bad is treated like an unreadable manifest, so reconcileScan keeps the last-good workload running instead
+// of replacing a healthy one with a broken spec (and a brand-new bad workload is simply never started).
+// Exercised in memory with manageProcesses=false. Complements 186 (the happy-path store-driven reconcile).
+import assert;
+import string;
+import store.config;
+import orch.nativelet;
+import orch.spec;
+
+fn specJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name + "\",\"replicas\":" + reps + "}";
+}
+// A spec that PARSES (valid JSON, non-empty name) but is semantically invalid: empty binaryPath.
+fn noBinaryJson(name: string): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"\",\"replicas\":3}";
+}
+// A spec with an unknown restartPolicy (also invalid).
+fn badPolicyJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name
+        + "\",\"replicas\":" + reps + ",\"restartPolicy\":\"reboot-the-universe\"}";
+}
+
+// validateSpec directly: the rules that gate an apply.
+@test
+fn test_validate_spec_rules(): void {
+    assert.equalStr(spec.validateSpec(spec.parseSpec(specJson("web", 2))), "");          // happy path
+    assert.equalStr(spec.validateSpec(spec.parseSpec(noBinaryJson("web"))), "empty binaryPath");
+    assert.isTrue(!string.eql(spec.validateSpec(spec.parseSpec(badPolicyJson("web", 1))), ""));
+
+    // A hand-built spec with an out-of-range isolation level is rejected.
+    let s = spec.Spec("web", "/bin/web");
+    s.isolationLevel = 2;
+    assert.equalStr(spec.validateSpec(s), "isolationLevel must be 0, 1, or 3");
+}
+
+// A bad UPDATE to a running workload keeps the last-good spec live (no tear-down, no replace).
+@test
+fn test_bad_update_keeps_last_good(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+
+    let _1 = store.put("workloads/web", specJson("web", 2));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);
+    assert.equalInt(n.desiredReplicas("web"), 2);
+
+    // A bad update lands (empty binaryPath). reconcile must KEEP web at the last-good replicas=2.
+    let _2 = store.put("workloads/web", noBinaryJson("web"));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);
+    assert.equalInt(n.desiredReplicas("web"), 2);            // unchanged: broken spec was NOT applied
+
+    // A second kind of bad update (unknown restartPolicy) is likewise ignored.
+    let _3 = store.put("workloads/web", badPolicyJson("web", 9));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.desiredReplicas("web"), 2);            // still the last-good spec
+
+    // A GOOD update after the bad ones still applies (the gate blocks only invalid specs).
+    let _4 = store.put("workloads/web", specJson("web", 5));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.desiredReplicas("web"), 5);            // healthy change goes through
+}
+
+// A brand-new workload whose FIRST spec is invalid is never started (nothing to keep, nothing to break).
+@test
+fn test_bad_new_workload_not_started(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+
+    let _1 = store.put("workloads/web", specJson("web", 1));   // one good workload
+    let _2 = store.put("workloads/broken", noBinaryJson("broken"));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.jobs.size(), 1);                        // only web started
+    assert.isTrue(n.findJobIdx("web") >= 0);
+    assert.isTrue(n.findJobIdx("broken") < 0);                // the invalid one was skipped
+}

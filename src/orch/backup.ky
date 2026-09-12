@@ -1,0 +1,79 @@
+// orch/backup.ky -- O3: logical backup/restore of the config store's key/value state. A line-oriented
+// dump (`key<TAB>value` per line) of every entry under a prefix; restore re-applies them via put. Built on
+// the ConfigStore list/put interface, so it works over the in-memory oracle (tests) and the live SqlConfigStore
+// alike -- a CLIENT-side logical backup (the btree TIER's physical page snapshot is D6/D7). Keys and values
+// are ESCAPED (backslash, TAB, newline -> `\\`, `\t`, `\n`), so a tab or newline inside a value can no longer
+// corrupt the line format; the RAW tab/newline stay purely structural (field separator / line terminator).
+import store.config;
+import list;
+import string;
+
+// Escape the structural bytes so they cannot appear raw inside a field: `\`->`\\`, TAB->`\t`, LF->`\n`.
+fn escapeField(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < string.len(s)) {
+        let c = s[i];
+        if (c == 92) { out = out + "\\\\"; }
+        else if (c == 9) { out = out + "\\t"; }
+        else if (c == 10) { out = out + "\\n"; }
+        else { out = out + string.charAt(s, i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Reverse escapeField.
+fn unescapeField(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < string.len(s)) {
+        let c = s[i];
+        if (c == 92 && i + 1 < string.len(s)) {
+            let n = s[i + 1];
+            if (n == 116) { out = out + "\t"; }
+            else if (n == 110) { out = out + "\n"; }
+            else if (n == 92) { out = out + "\\"; }
+            else { out = out + string.charAt(s, i + 1); }
+            i = i + 2;
+        } else {
+            out = out + string.charAt(s, i);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// Serialize every entry under `prefix` to an escaped `key<TAB>value` dump (deterministic: store.list order).
+pub fn dump(store: config.ConfigStore, prefix: string): string {
+    let out = "";
+    let entries = store.list(prefix);
+    let i = 0;
+    while (i < entries.size()) {
+        let e = entries.get(i) ?? config.ConfigEntry("", "", 0);
+        out = out + escapeField(e.key) + "\t" + escapeField(e.value) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+// Restore a dump into `store` via put (last-writer-wins). Returns the number of entries applied.
+pub fn restore(store: config.ConfigStore, data: string): int {
+    let n = 0;
+    let lines = string.split(data, "\n");
+    let i = 0;
+    while (i < lines.size()) {
+        let ln = lines.get(i) ?? "";
+        if (!string.eql(ln, "")) {
+            let tab = string.indexOf(ln, "\t");   // the RAW separator (escaped tabs are `\t`, 2 chars)
+            if (tab > 0) {
+                let key = unescapeField(string.slice(ln, 0, tab));
+                let val = unescapeField(string.slice(ln, tab + 1, string.len(ln)));
+                let _ = store.put(key, val);
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}

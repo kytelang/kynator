@@ -1,0 +1,110 @@
+// 183 - manifest -> Spec -> Supervisor wiring. Proves the declarative manifest drives the process
+// runner: toSpec maps every field the supervisor needs, the supervisor keeps replicas.min running, and
+// a rescale (what the control-plane autoscaler will drive within [min,max]) tops up / trims correctly.
+// Simulated supervisor (virtual replicas): no real binaries, no timing races.
+import assert;
+import string;
+import platform;
+import orch.manifest;
+import orch.supervisor;
+
+fn publicYaml(): string {
+    return "metadata:\n  name: shop\n" +
+           "workload:\n  binary: ./bin/webapp\n  args:\n    - --config\n    - prod\n  restartPolicy: always\n" +
+           "replicas:\n  min: 3\n  max: 6\n" +
+           "network:\n  expose: public\n  portBase: 8080\n  portFlag: --port\n" +
+           "health:\n  path: /healthz\n  intervalMs: 1500\n" +
+           "resources:\n  cpuMilli: 500\n  memMaxBytes: 268435456\n  pidsMax: 128\n";
+}
+
+@test
+fn test_toSpec_maps_manifest_fields(): void {
+    let m = manifest.parseManifest(publicYaml());
+    let s = manifest.toSpec(m);
+    assert.equalStr(s.name, "shop");
+    assert.equalStr(s.binaryPath, "./bin/webapp");
+    assert.equalInt(s.args.size(), 2);
+    assert.equalStr(s.args.get(0) ?? "", "--config");
+    assert.equalStr(s.restartPolicy, "always");
+    assert.equalInt(s.replicas, 3);                 // initial desired = replicas.min
+    assert.equalInt(s.cpuMilli, 500);
+    assert.isTrue(s.memMaxBytes == (268435456 as long));
+    assert.equalInt(s.pidsMax, 128);
+    assert.equalStr(s.probePath, "/healthz");
+    assert.equalInt(s.probePeriodMs, 1500);
+    // public exposure => port config flows through
+    assert.equalInt(s.basePort, 8080);
+    assert.equalStr(s.portFlag, "--port");
+    // probePort is deliberately 0: kynatord does NOT run its own HTTP readiness probe (redundant with the
+    // data-plane service's health checks, and it triggered a lang reactor crash). Readiness is the service's
+    // job; kynatord owns process-liveness supervision.
+    assert.equalInt(s.probePort, 0);
+}
+
+@test
+fn test_gateway_only_defaults_to_handoff(): void {
+    // A default gateway-only app (lb.handoff defaults true) uses fd-handoff: no host port, no netns; the
+    // supervisor spawns each replica with KYTE_HANDOFF_SOCK = the workload's rendezvous.
+    let m = manifest.parseManifest("metadata:\n  name: api\nworkload:\n  binary: /bin/api\nreplicas:\n  min: 2\n  max: 4\n");
+    let s = manifest.toSpec(m);
+    assert.equalInt(s.replicas, 2);
+    assert.isTrue(s.handoff);
+    assert.equalStr(s.handoffSock, "/tmp/kyte-api.sock");
+    assert.equalInt(s.basePort, 0);                 // no host port
+    assert.isTrue(!s.netns);
+}
+
+@test
+fn test_handoff_off_uses_netns_or_loopback(): void {
+    // Explicitly turning handoff off is what selects the netns/loopback path for a gateway-only app.
+    let m = manifest.parseManifest("metadata:\n  name: api\nworkload:\n  binary: /bin/api\nlb:\n  handoff: false\n");
+    let s = manifest.toSpec(m);
+    assert.isTrue(!s.handoff);
+    if (string.eql(manifest.isolationMode(m), "netns")) { assert.isTrue(s.netns); }
+    else { assert.isTrue(!s.netns); }
+}
+
+@test
+fn test_service_spec_for_handoff_workload(): void {
+    // The service (gateway) Spec kynatord launches for a handoff workload: the service binary, one replica,
+    // handoff on the SAME rendezvous as the apps, listening on the front port.
+    let m = manifest.parseManifest("metadata:\n  name: shop\nworkload:\n  binary: /bin/shop\nnetwork:\n  servicePort: 8140\n");
+    let s = manifest.serviceSpecFor(m, "/opt/kyte/bin/service");
+    assert.equalStr(s.name, "shop-svc");
+    assert.equalStr(s.binaryPath, "/opt/kyte/bin/service");
+    assert.equalInt(s.replicas, 1);
+    assert.isTrue(s.handoff);
+    assert.equalStr(s.handoffSock, "/tmp/kyte-shop.sock");   // matches toSpec(app).handoffSock
+    assert.equalStr(manifest.toSpec(m).handoffSock, "/tmp/kyte-shop.sock");
+    assert.equalInt(s.basePort, 8140);                        // supervisor sets KYTE_PORT from this
+}
+
+@test
+fn test_supervisor_handoff_advertises_nothing(): void {
+    // A handoff workload advertises no endpoints (apps register over the rendezvous, not host:port).
+    let s = manifest.toSpec(manifest.parseManifest("metadata:\n  name: shop\nworkload:\n  binary: /bin/shop\nreplicas:\n  min: 3\n  max: 5\n"));
+    assert.isTrue(s.handoff);
+    let sup = supervisor.Supervisor(s);
+    sup.simulated = true;
+    sup.start();
+    assert.equalInt(sup.running(), 3);                          // sim keeps replicas.min
+    assert.equalInt(sup.advertisedEndpoints("host").size(), 0); // handoff => nothing advertised
+}
+
+@test
+fn test_supervisor_runs_from_manifest_and_rescales(): void {
+    let s = manifest.toSpec(manifest.parseManifest(publicYaml()));
+    let sup = supervisor.Supervisor(s);
+    sup.simulated = true;
+    sup.start();
+    assert.equalInt(sup.running(), 3);              // keeps replicas.min
+
+    // Autoscaler drives spec.replicas within [min,max]; ensureReplicas actuates it.
+    s.replicas = 6;
+    sup.ensureReplicas();
+    assert.equalInt(sup.running(), 6);              // scaled up to max
+
+    s.replicas = 2;
+    sup.ensureReplicas();
+    assert.equalInt(sup.running(), 2);              // scaled down
+}

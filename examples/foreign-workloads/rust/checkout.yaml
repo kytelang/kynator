@@ -1,0 +1,19 @@
+apiVersion: kyte/v1
+kind: App
+metadata:
+  name: checkout-rust
+workload:
+  workloadType: foreign
+  binary: ./rust/app         # built by ../build.sh; give an absolute path for a real deploy
+  restartPolicy: always
+  portEnv: PORT              # the Rust server reads $PORT
+  env:
+    - FOO=rust-env
+replicas:
+  min: 2
+  max: 2
+network:
+  expose: gateway-only
+  portBase: 18290
+health:
+  probeType: tcp

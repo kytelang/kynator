@@ -1,0 +1,74 @@
+// orch/rollout.ky -- O3: automate a rolling upgrade of the control-plane nodes with rollback.
+//
+// Each node is rolled one at a time through DRAIN -> PROMOTE -> UPGRADE -> REJOIN: if the node currently
+// holds the leader lease it first drains (releases the lease so a peer promotes, keeping leadership -- and
+// therefore control-plane availability -- unbroken), then it "upgrades", then it rejoins as a standby. A
+// node whose upgrade fails ROLLS BACK (rejoins at its old version) and the rollout stops, leaving the
+// cluster healthy with a valid leader. Pure policy over the same LeaderLease + ConfigStore the O2 cluster
+// uses, so it is deterministic and unit-testable with a mock clock; the live daemon runs the identical
+// steps against the async lease.
+import store.config;
+import orch.lease;
+import list;
+import string;
+
+pub struct RolloutResult {
+    pub ok: bool,
+    pub upgraded: int,        // how many nodes finished upgrading before the rollout stopped
+    pub leader: string,       // the valid leader at the end ("" if somehow none)
+    pub message: string,
+    init(ok: bool, upgraded: int, leader: string, message: string) {
+        self.ok = ok;
+        self.upgraded = upgraded;
+        self.leader = leader;
+        self.message = message;
+    }
+}
+
+fn defNode(): lease.LeaderLease { return lease.LeaderLease(config.ConfigStore(), "", "", 0); }
+
+// Promote the first node other than `exclude` that can take the (drained) lease at `nowMs`.
+fn promoteOther(nodes: list.List<lease.LeaderLease>, exclude: string, nowMs: long): string {
+    let i = 0;
+    while (i < nodes.size()) {
+        let nd = nodes.get(i) ?? defNode();
+        // NOTE: keep the side-effecting tryAcquire OUT of a `&&` -- a method call with side effects as the
+        // RHS of `&&` is mis-evaluated here, so use a nested if.
+        if (!string.eql(nd.nodeId, exclude)) {
+            if (nd.tryAcquire(nowMs)) { return nd.nodeId; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Roll every node through drain/promote/upgrade/rejoin in list order. healthy[i] = did node i's upgrade
+// succeed (default true). stepMs advances the mock clock between phases so a drained lease expires and the
+// promoting peer can take over deterministically.
+pub fn rollingUpgrade(nodes: list.List<lease.LeaderLease>, healthy: list.List<bool>, startMs: long, stepMs: long): RolloutResult {
+    let t = startMs;
+    let i = 0;
+    while (i < nodes.size()) {
+        let nd = nodes.get(i) ?? defNode();
+
+        // DRAIN + PROMOTE: only if this node is the live leader, so leadership is never lost.
+        if (nd.stillLeader(t)) {
+            let _ = nd.release(t);
+            t = t + stepMs;
+            let newL = promoteOther(nodes, nd.nodeId, t);
+            if (string.eql(newL, "")) {
+                return RolloutResult(false, i, lease.electedLeaderId(nodes, defNode(), t), "no peer could take leadership during drain");
+            }
+        }
+
+        // UPGRADE: a failed upgrade rolls back (the node rejoins at its old version) and stops the rollout.
+        let ok = healthy.get(i) ?? true;
+        let _ = nd.tryAcquire(t);        // REJOIN as a standby (a leader exists, so it does not take over)
+        if (!ok) {
+            return RolloutResult(false, i, lease.electedLeaderId(nodes, defNode(), t), `upgrade of ${nd.nodeId} failed; rolled back`);
+        }
+        t = t + stepMs;
+        i = i + 1;
+    }
+    return RolloutResult(true, nodes.size(), lease.electedLeaderId(nodes, defNode(), t), "rolling upgrade complete");
+}

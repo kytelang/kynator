@@ -1,0 +1,173 @@
+// 194 -- config surface for the split service/kynatord binaries: defaults, JSON load, and validation.
+// Pure/offline (no sockets); exercises cfg.config the two entrypoints depend on so a bad config is
+// rejected loudly at startup rather than silently defaulted.
+import assert;
+import cfg.config;
+import string;
+import io.file;
+
+// ---- service defaults + validation ----
+
+@test
+fn test_proxy_defaults(): void {
+    let c = config.ProxyConfig();
+    assert.equalInt(c.listenPort, 8080);
+    assert.equalStr(c.strategy, "roundrobin");
+    assert.equalInt(c.backends.size(), 0);
+    // Defaults have no backend source, so validation must reject them.
+    assert.isFalse(string.eql(config.validateProxy(c), ""));
+}
+
+@test
+fn test_proxy_valid_with_backend(): void {
+    let c = config.ProxyConfig();
+    c.backends.push(config.BackendCfg("127.0.0.1", 9001, 1));
+    assert.equalStr(config.validateProxy(c), "");   // now valid
+}
+
+@test
+fn test_proxy_rejects_bad_strategy(): void {
+    let c = config.ProxyConfig();
+    c.backends.push(config.BackendCfg("127.0.0.1", 9001, 1));
+    c.strategy = "bogus";
+    assert.isFalse(string.eql(config.validateProxy(c), ""));
+}
+
+@test
+fn test_proxy_rejects_bad_port_and_weight(): void {
+    let c = config.ProxyConfig();
+    c.listenPort = 70000;
+    assert.isFalse(string.eql(config.validateProxy(c), ""));
+
+    let c2 = config.ProxyConfig();
+    c2.backends.push(config.BackendCfg("h", 9001, 0));   // weight < 1
+    assert.isFalse(string.eql(config.validateProxy(c2), ""));
+}
+
+@test
+fn test_proxy_discovery_requires_service(): void {
+    let c = config.ProxyConfig();
+    c.discoveryFile = "svc.disc";   // set file but no service name
+    assert.isFalse(string.eql(config.validateProxy(c), ""));
+    c.discoveryService = "web";
+    assert.equalStr(config.validateProxy(c), "");
+}
+
+@test
+fn test_known_strategy(): void {
+    assert.isTrue(config.knownStrategy("roundrobin"));
+    assert.isTrue(config.knownStrategy("weighted"));
+    assert.isTrue(config.knownStrategy("leastconn"));
+    assert.isTrue(config.knownStrategy("consistenthash"));
+    assert.isFalse(config.knownStrategy("random"));
+}
+
+// ---- service JSON load round-trip ----
+
+@test
+fn test_proxy_load_from_json(): void {
+    let path = "/tmp/kyte_orch_test_service.json";
+    file.File.writeText(path,
+        "{\"listenPort\":9443,\"strategy\":\"weighted\","
+        + "\"health\":{\"enabled\":true,\"intervalMs\":1500},"
+        + "\"backends\":[{\"host\":\"10.0.0.1\",\"port\":8001,\"weight\":3},"
+        + "{\"host\":\"10.0.0.2\",\"port\":8002}]}");
+    let c = config.loadProxyConfig(path);
+    assert.equalInt(c.listenPort, 9443);
+    assert.equalStr(c.strategy, "weighted");
+    assert.isTrue(c.healthChecks);
+    assert.equalInt(c.healthIntervalMs, 1500);
+    assert.equalInt(c.backends.size(), 2);
+    let b0 = c.backends.get(0) ?? config.BackendCfg("", 0, 1);
+    assert.equalStr(b0.host, "10.0.0.1");
+    assert.equalInt(b0.port, 8001);
+    assert.equalInt(b0.weight, 3);
+    let b1 = c.backends.get(1) ?? config.BackendCfg("", 0, 1);
+    assert.equalInt(b1.weight, 1);   // defaulted
+    assert.equalStr(config.validateProxy(c), "");
+}
+
+@test
+fn test_proxy_missing_file_is_defaults(): void {
+    let c = config.loadProxyConfig("/tmp/kyte_orch_does_not_exist_ba.json");
+    assert.equalInt(c.listenPort, 8080);
+    assert.equalInt(c.backends.size(), 0);
+}
+
+// ---- kynatord defaults + validation ----
+
+@test
+fn test_orch_defaults_and_validate(): void {
+    let c = config.OrchConfig();
+    assert.equalStr(c.manifestsDir, "manifests");
+    assert.equalInt(c.reconcileMs, 2000);
+    assert.equalStr(config.validateOrch(c), "");   // defaults are valid
+}
+
+@test
+fn test_orch_rejects_bad_values(): void {
+    let c = config.OrchConfig();
+    c.reconcileMs = 0;
+    assert.isFalse(string.eql(config.validateOrch(c), ""));
+    let c2 = config.OrchConfig();
+    c2.manifestsDir = "";
+    assert.isFalse(string.eql(config.validateOrch(c2), ""));
+}
+
+@test
+fn test_orch_load_from_json(): void {
+    let path = "/tmp/kyte_orch_test_orchd.json";
+    file.File.writeText(path, "{\"manifestsDir\":\"/etc/workloads\",\"reconcileMs\":5000,\"nodeId\":\"n7\"}");
+    let c = config.loadOrchConfig(path);
+    assert.equalStr(c.manifestsDir, "/etc/workloads");
+    assert.equalInt(c.reconcileMs, 5000);
+    assert.equalStr(c.nodeId, "n7");
+    assert.equalStr(config.validateOrch(c), "");
+}
+
+// ---- O4: config-store base URL (artifactd-hosted; NovaDB removed) ----
+
+@test
+fn test_store_base_url_http(): void {
+    let s = config.StoreConfig();
+    s.enabled = true;
+    s.addr = "10.0.0.9:8135";
+    let base = config.storeBaseUrl(s);
+    assert.equalStr(base, "http://10.0.0.9:8135");   // TLS off -> http scheme
+}
+
+@test
+fn test_store_base_url_https(): void {
+    let s = config.StoreConfig();
+    s.enabled = true;
+    s.addr = "artifactd.internal:8135";
+    s.tls = true;
+    let base = config.storeBaseUrl(s);
+    assert.equalStr(base, "https://artifactd.internal:8135");   // TLS on -> https scheme
+}
+
+@test
+fn test_store_validation(): void {
+    let s = config.StoreConfig();               // disabled -> always valid
+    assert.equalStr(config.validateStore(s), "");
+    s.enabled = true;
+    s.addr = "";                                // enabled but no addr -> invalid
+    assert.isFalse(string.eql(config.validateStore(s), ""));
+    s.addr = "127.0.0.1:8135";
+    assert.equalStr(config.validateStore(s), "");
+}
+
+@test
+fn test_orch_load_store_section(): void {
+    let path = "/tmp/kyte_orch_test_orchd_store.json";
+    file.File.writeText(path,
+        "{\"nodeId\":\"n1\",\"store\":{\"enabled\":true,\"addr\":\"127.0.0.1:8135\","
+        + "\"token\":\"deploytok\",\"tls\":true}}");
+    let c = config.loadOrchConfig(path);
+    assert.isTrue(c.store.enabled);
+    assert.equalStr(c.store.token, "deploytok");
+    assert.isTrue(c.store.tls);
+    assert.equalStr(config.validateOrch(c), "");
+    let base = config.storeBaseUrl(c.store);
+    assert.equalStr(base, "https://127.0.0.1:8135");
+}

@@ -1,0 +1,113 @@
+// 185 - Linux network-namespace + veth isolation (net/netns). The addressing plan, the exact `ip`
+// command recipe, the exec wrapper, and the platform gating are pure and asserted here on any OS; the
+// actual kernel setup runs only on Linux (with `ip` + CAP_NET_ADMIN) and is verified there separately.
+import assert;
+import string;
+import list;
+import platform;
+import net.netns;
+import orch.manifest;
+import orch.spec;
+import orch.supervisor;
+
+fn join(a: list.List<string>): string {
+    let out = "";
+    let i = 0;
+    while (i < a.size()) {
+        if (i > 0) { out = out + " "; }
+        out = out + (a.get(i) ?? "");
+        i = i + 1;
+    }
+    return out;
+}
+
+@test
+fn test_plan_addressing(): void {
+    let p = netns.plan("shop", 0);
+    assert.equalStr(p.netns, "kyte-shop-0");
+    assert.equalStr(p.hostIf, "nvh0");
+    assert.equalStr(p.appIf, "nva0");
+    assert.equalStr(p.hostIp, "10.66.0.1");   // gateway reaches the app through this
+    assert.equalStr(p.appIp, "10.66.0.2");    // app binds here, private to the link
+    assert.equalInt(p.prefixLen, 30);
+    // a second slot gets a disjoint /30
+    let q = netns.plan("api", 5);
+    assert.equalStr(q.netns, "kyte-api-5");
+    assert.equalStr(q.hostIp, "10.66.5.1");
+    assert.equalStr(q.appIp, "10.66.5.2");
+}
+
+@test
+fn test_setup_command_recipe(): void {
+    let p = netns.plan("shop", 0);
+    let c = netns.setupCommands(p);
+    assert.equalInt(c.size(), 9);
+    assert.equalStr(join(c.get(0) ?? list.List<string>()), "netns add kyte-shop-0");
+    assert.equalStr(join(c.get(1) ?? list.List<string>()), "link add nvh0 type veth peer name nva0");
+    assert.equalStr(join(c.get(2) ?? list.List<string>()), "link set nva0 netns kyte-shop-0");
+    assert.equalStr(join(c.get(3) ?? list.List<string>()), "addr add 10.66.0.1/30 dev nvh0");
+    assert.equalStr(join(c.get(4) ?? list.List<string>()), "link set nvh0 up");
+    assert.equalStr(join(c.get(5) ?? list.List<string>()), "-n kyte-shop-0 addr add 10.66.0.2/30 dev nva0");
+    assert.equalStr(join(c.get(8) ?? list.List<string>()), "-n kyte-shop-0 route add default via 10.66.0.1");
+}
+
+@test
+fn test_teardown_recipe(): void {
+    let p = netns.plan("shop", 0);
+    let c = netns.teardownCommands(p);
+    assert.equalInt(c.size(), 2);
+    assert.equalStr(join(c.get(0) ?? list.List<string>()), "link del nvh0");
+    assert.equalStr(join(c.get(1) ?? list.List<string>()), "netns del kyte-shop-0");
+}
+
+@test
+fn test_exec_wrapping(): void {
+    let p = netns.plan("shop", 0);
+    assert.equalStr(join(netns.execPrefix(p)), "netns exec kyte-shop-0");
+    let args = list.List<string>();
+    args.push("--port"); args.push("0");
+    // spawn "ip" with these args => runs /bin/webapp inside the app namespace
+    assert.equalStr(join(netns.wrapExec(p, "/bin/webapp", args)), "netns exec kyte-shop-0 /bin/webapp --port 0");
+}
+
+@test
+fn test_availability_is_platform_gated(): void {
+    // netns isolation is Linux-only; on any other host available() is false and setup() no-ops (-1).
+    if (platform.isLinux) {
+        assert.isTrue(true);   // on Linux availability depends on the `ip` tool being installed
+    } else {
+        assert.isTrue(!netns.available());
+        assert.equalInt(netns.setup(netns.plan("x", 0)), -1);
+    }
+}
+
+@test
+fn test_supervisor_advertises_netns_addresses(): void {
+    // In netns mode the supervisor advertises each replica's PRIVATE veth address:basePort (what the
+    // gateway forwards to), not a host port. Drive it directly by seeding the per-replica slots that
+    // spawnOne would record (real spawn needs Linux; the advertisement computation is pure).
+    let s = spec.Spec("shop", "/bin/webapp");
+    s.netns = true;
+    s.basePort = 8080;
+    let sup = supervisor.Supervisor(s);
+    sup.netnsSlots.push(0);
+    sup.netnsSlots.push(1);
+    let eps = sup.advertisedEndpoints("ignored-host");
+    assert.equalInt(eps.size(), 2);
+    assert.equalStr(eps.get(0) ?? "", "10.66.0.2:8080");
+    assert.equalStr(eps.get(1) ?? "", "10.66.1.2:8080");
+}
+
+@test
+fn test_isolation_mode_is_platform_selected(): void {
+    // gateway-only intent -> platform-selected mechanism; public -> a host port.
+    let gw = manifest.parseManifest("metadata:\n  name: shop\nworkload:\n  binary: /b\n");
+    let pubm = manifest.parseManifest("metadata:\n  name: shop\nworkload:\n  binary: /b\nnetwork:\n  expose: public\n");
+    assert.equalStr(manifest.isolationMode(pubm), "public");
+    if (platform.isLinux) {
+        let mode = manifest.isolationMode(gw);
+        assert.isTrue(string.eql(mode, "netns") || string.eql(mode, "loopback"));
+    } else {
+        assert.equalStr(manifest.isolationMode(gw), "handoff");   // mac/win => fd-handoff
+    }
+}

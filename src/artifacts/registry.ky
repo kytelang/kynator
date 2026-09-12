@@ -1,0 +1,174 @@
+// artifacts/registry.ky -- the app/version NAMESPACE over the content-addressed blob store.
+//
+// The blob store (artifacts/blobstore.ky) is keyed only by sha256: immutable, deduplicated, integrity
+// self-checking, but not human-navigable. The registry is the naming layer on top, exactly the Docker/OCI
+// split of "content blobs" vs "repository:tag -> digest": a deploy is published as an (app, version) pair
+// that POINTS AT a content digest, and rolling forward/back is just repointing a name -- the bytes never
+// move or duplicate.
+//
+//   <root>/apps/<app>/<version>   -- a tiny pointer file whose contents are "sha256:<hex>"
+//   <root>/apps/<app>/current     -- a pointer file whose contents are the promoted version string
+//   <root>/blobs/<ab>/<cd>/<sha>  -- the actual content (owned by the BlobStore, shared across apps)
+//
+// So `shop` 1.2.0 and `notes` 0.9.0 that ship byte-identical binaries share ONE blob; promoting a version
+// is a one-line write; and every served binary is still verified against its own hash on the way out.
+import io.file;
+import io.dir;
+import string;
+import list;
+import artifacts.blobstore;
+
+pub class Registry {
+    root: string,               // the apps/ namespace root (e.g. <artifact-root>/apps)
+    blobs: blobstore.BlobStore, // the content store the pointers resolve into
+
+    init(root: string, blobs: blobstore.BlobStore) {
+        self.root = root;
+        self.blobs = blobs;
+    }
+
+    // A safe single path segment for an app or version name: non-empty, no path separators, no "." / ".."
+    // and no leading dot (which would hide it / let ".." through), restricted to a portable filename
+    // charset. This is the traversal guard for the namespace, the way validSha guards the blob layer.
+    pub fn validName(self: Registry, name: string): bool {
+        let n = string.len(name);
+        if (n == 0 || n > 128) { return false; }
+        if (name[0] == 46) { return false; }                 // no leading '.'  (blocks "." "..")
+        let i = 0;
+        while (i < n) {
+            let c = name[i];
+            let ok = (c >= 48 && c <= 57)                     // 0-9
+                || (c >= 65 && c <= 90)                       // A-Z
+                || (c >= 97 && c <= 122)                      // a-z
+                || c == 46 || c == 45 || c == 95;             // . - _
+            if (!ok) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn appDir(self: Registry, app: string): string { return self.root + "/" + app; }
+    fn versionFile(self: Registry, app: string, version: string): string {
+        return self.appDir(app) + "/" + version;
+    }
+    fn currentFile(self: Registry, app: string): string {
+        return self.appDir(app) + "/current";
+    }
+
+    // Bind (app, version) -> the content digest `ref` ("sha256:<hex>" or a bare hex). The referenced blob
+    // MUST already be present (CI uploads content first, then names it), so a version can never point at
+    // bytes that are not there. Idempotent: re-binding the SAME digest is a no-op success; re-binding a
+    // DIFFERENT digest to an existing version is refused (versions are immutable -- publish a new one).
+    // "current" is a reserved name (it is the promotion pointer, not a version). Returns "" on success,
+    // else a short reason.
+    pub fn bind(self: Registry, app: string, version: string, ref: string): string {
+        if (!self.validName(app)) { return "bad app name"; }
+        if (!self.validName(version)) { return "bad version name"; }
+        if (string.eql(version, "current")) { return "'current' is reserved"; }
+        let sha = shaOfRef(ref);
+        if (!self.blobs.validSha(sha)) { return "bad digest"; }
+        if (!self.blobs.has(sha)) { return "blob not uploaded"; }        // content must exist first
+        let vf = self.versionFile(app, version);
+        if (File.exists(vf)) {
+            let existing = shaOfRef(File.readText(vf));
+            if (string.eql(existing, sha)) { return ""; }               // idempotent re-bind
+            return "version already bound to a different digest";       // immutable
+        }
+        ensureDir(self.appDir(app));
+        if (!File.writeTextOk(vf, "sha256:" + sha)) { return "write failed"; }
+        return "";
+    }
+
+    // Resolve (app, version) -> its digest ref ("sha256:<hex>"), or undefined if unbound / malformed.
+    pub fn resolve(self: Registry, app: string, version: string): string | undefined {
+        if (!self.validName(app) || !self.validName(version)) { return undefined; }
+        let vf = self.versionFile(app, version);
+        if (!File.exists(vf)) { return undefined; }
+        let sha = shaOfRef(File.readText(vf));
+        if (!self.blobs.validSha(sha)) { return undefined; }
+        return "sha256:" + sha;
+    }
+
+    // Resolve (app, version) all the way to the (verified) binary bytes, or undefined if unbound / the
+    // blob is missing or fails its on-read hash check (BlobStore.get verifies).
+    pub fn binary(self: Registry, app: string, version: string): string | undefined {
+        let ref = self.resolve(app, version);
+        if (ref == undefined) { return undefined; }
+        return self.blobs.get(shaOfRef(ref ?? ""));
+    }
+
+    // Promote a version to the app's "current" pointer (the rollout/rollback lever). The version must
+    // already be bound. Returns "" on success, else a short reason.
+    pub fn promote(self: Registry, app: string, version: string): string {
+        if (!self.validName(app)) { return "bad app name"; }
+        if (!self.validName(version)) { return "bad version name"; }
+        if (string.eql(version, "current")) { return "'current' is reserved"; }
+        if (self.resolve(app, version) == undefined) { return "no such version"; }
+        ensureDir(self.appDir(app));
+        if (!File.writeTextOk(self.currentFile(app), version)) { return "write failed"; }
+        return "";
+    }
+
+    // The app's currently-promoted version string, or undefined if none has been promoted.
+    pub fn current(self: Registry, app: string): string | undefined {
+        if (!self.validName(app)) { return undefined; }
+        let cf = self.currentFile(app);
+        if (!File.exists(cf)) { return undefined; }
+        return File.readText(cf);
+    }
+
+    // Every bound version of `app` (the pointer files under its dir, minus "current" and the dot entries).
+    // Order is filesystem order; callers that need it sorted own that.
+    pub fn versions(self: Registry, app: string): List<string> {
+        let out = List<string>();
+        if (!self.validName(app)) { return out; }
+        let d = self.appDir(app);
+        if (!Dir.exists(d)) { return out; }
+        let dir = Dir.open(d);
+        let ents = dir.entries();
+        dir.close();
+        let i = 0;
+        while (i < ents.size()) {
+            let e = ents.get(i) ?? "";
+            if (!string.eql(e, ".") && !string.eql(e, "..") && !string.eql(e, "current")) {
+                out.push(e);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// "sha256:<hex>" -> "<hex>"; a bare "<hex>" is returned unchanged; surrounding whitespace/newline (a
+// pointer file may have a trailing newline) is trimmed so a hand-edited pointer still resolves.
+pub fn shaOfRef(ref: string): string {
+    let s = trim(ref);
+    if (string.startsWith(s, "sha256:")) { return string.slice(s, 7, string.len(s)); }
+    return s;
+}
+
+fn trim(s: string): string {
+    let n = string.len(s);
+    let start = 0;
+    while (start < n && isSpace(s[start])) { start = start + 1; }
+    let end = n;
+    while (end > start && isSpace(s[end - 1])) { end = end - 1; }
+    return string.slice(s, start, end);
+}
+fn isSpace(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+
+// mkdir -p: create every ancestor of `path` (single-level Dir.create is all the stdlib exposes). mkdir on
+// an existing directory is a harmless non-zero return, so each prefix is created best-effort.
+fn ensureDir(path: string): void {
+    let n = string.len(path);
+    let i = 1;
+    while (i <= n) {
+        if (i == n || path[i] == 47) {                 // 47 = '/'
+            let prefix = string.slice(path, 0, i);
+            if (!string.eql(prefix, "") && !string.eql(prefix, "/")) {
+                let _ = Dir.create(prefix, 493);        // 0o755
+            }
+        }
+        i = i + 1;
+    }
+}

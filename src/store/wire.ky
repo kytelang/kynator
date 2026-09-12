@@ -1,0 +1,137 @@
+// store/wire.ky -- a tiny, binary-safe framing for config-store entries and events on an HTTP body.
+//
+// The config store now lives inside artifactd and is reached over HTTP (store/httpconfig.ky ->
+// artifacts/cfgstore.ky). get/list/watch have to return WHOLE ConfigEntry / ConfigEvent records
+// (key, value, revision, updatedBy, updatedAt) and the value can be arbitrary bytes (a YAML spec, a
+// lease encoding), so a line- or JSON-based body would not round-trip cleanly. Instead every variable
+// field is length-prefixed: `<decimalLen>:<that many bytes>`. Fixed-shape numeric fields ride as their
+// own length-prefixed decimal text. This is the same "the length is the frame" discipline the wire
+// protocol uses, kept deliberately trivial because a config store holds few, small records.
+//
+// Entry frame  = field(key) field(value) field(revision) field(updatedBy) field(updatedAt)
+// Event frame  = field(key) field(value) field(revision) field(deleted "1"/"0")
+// A body is zero or more frames concatenated; decoding stops at end of input.
+
+import string;
+import list;
+import store.config;
+
+// Version of this config-store wire contract (the framing + record shapes + the `/cfg/*` route set). It is
+// served at `GET /cfg/version` as "kyte-cfg/<N>" so a client can detect a future incompatible change before
+// it mis-parses a body. Bump ONLY on a breaking change to the framing or record layout (see STABILITY.md).
+pub const WIRE_VERSION: int = 1;
+
+// The version token a client checks, e.g. "kyte-cfg/1".
+pub fn wireVersionString(): string { return `kyte-cfg/${WIRE_VERSION}`; }
+
+// One length-prefixed field: `<len>:<bytes>`. Binary-safe -- len counts bytes, not characters.
+pub fn field(s: string): string {
+    return `${string.len(s)}:` + s;
+}
+
+// A cursor over a framed body: pos advances past each field read. Kept as a class (reference) so
+// readField() can mutate pos in place while the caller loops on atEnd().
+pub class Cursor {
+    buf: string,
+    pos: int,
+    ok: bool,      // cleared if a frame is malformed; callers stop reading
+
+    init(buf: string) {
+        self.buf = buf;
+        self.pos = 0;
+        self.ok = true;
+    }
+
+    pub fn atEnd(self: Cursor): bool {
+        return self.pos >= string.len(self.buf);
+    }
+
+    // Read one `<len>:<bytes>` field, advancing pos past it. On any malformation clears ok and
+    // returns "" (the caller checks atEnd()/ok and stops), so a truncated body cannot loop forever.
+    pub fn readField(self: Cursor): string {
+        let n = string.len(self.buf);
+        let i = self.pos;
+        let len = 0;
+        let sawDigit = false;
+        while (i < n && self.buf[i] != 58) {          // 58 = ':'
+            let c = self.buf[i];
+            if (c < 48 || c > 57) { self.ok = false; return ""; }   // non-digit before ':'
+            len = len * 10 + (c - 48);
+            sawDigit = true;
+            i = i + 1;
+        }
+        if (!sawDigit || i >= n) { self.ok = false; return ""; }    // no digits, or no ':'
+        i = i + 1;                                                  // skip ':'
+        if (i + len > n) { self.ok = false; return ""; }            // field runs past the buffer
+        let s = string.slice(self.buf, i, i + len);
+        self.pos = i + len;
+        return s;
+    }
+}
+
+fn parseLongOr0(s: string): long {
+    return string.parseLong(s) ?? (0 as long);
+}
+
+// ---- entries (get / list) -------------------------------------------------------------------------
+
+pub fn encodeEntry(e: config.ConfigEntry): string {
+    return field(e.key) + field(e.value) + field(`${e.revision}`) + field(e.updatedBy) + field(`${e.updatedAt}`);
+}
+
+pub fn encodeEntries(entries: list.List<config.ConfigEntry>): string {
+    let out = "";
+    let i = 0;
+    while (i < entries.size()) {
+        let e = entries.get(i) ?? config.ConfigEntry("", "", 0);
+        out = out + encodeEntry(e);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn decodeEntries(body: string): list.List<config.ConfigEntry> {
+    let out = list.List<config.ConfigEntry>();
+    let cur = Cursor(body);
+    while (!cur.atEnd() && cur.ok) {
+        let k = cur.readField();
+        let v = cur.readField();
+        let rev = cur.readField();
+        let by = cur.readField();
+        let at = cur.readField();
+        if (!cur.ok) { return out; }
+        let e = config.ConfigEntry(k, v, parseLongOr0(rev));
+        e.updatedBy = by;
+        e.updatedAt = parseLongOr0(at);
+        out.push(e);
+    }
+    return out;
+}
+
+// ---- events (watch) -------------------------------------------------------------------------------
+
+pub fn encodeEvents(events: list.List<config.ConfigEvent>): string {
+    let out = "";
+    let i = 0;
+    while (i < events.size()) {
+        let ev = events.get(i) ?? config.ConfigEvent("", "", 0, false);
+        let del = if (ev.deleted) "1" else "0";
+        out = out + field(ev.key) + field(ev.value) + field(`${ev.revision}`) + field(del);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn decodeEvents(body: string): list.List<config.ConfigEvent> {
+    let out = list.List<config.ConfigEvent>();
+    let cur = Cursor(body);
+    while (!cur.atEnd() && cur.ok) {
+        let k = cur.readField();
+        let v = cur.readField();
+        let rev = cur.readField();
+        let del = cur.readField();
+        if (!cur.ok) { return out; }
+        out.push(config.ConfigEvent(k, v, parseLongOr0(rev), string.eql(del, "1")));
+    }
+    return out;
+}

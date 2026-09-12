@@ -1,0 +1,133 @@
+// 184 -- P1 config-store core (docs/beta-config-store-design.md). The etcd-shaped KV the orchestrator
+// reconciles from, exercised offline: put/get/revision, prefix list, compare-and-set on revision (the
+// leader-lease primitive), delete, and poll-based watch-since-revision. Binding this to BTreeDB over the
+// async database interface is proven live separately (same split as the nativelet's process lifecycle).
+import assert;
+import list;
+import string;
+import store.config;
+
+// put bumps a monotonic global revision; get reads value + its mod-revision; exists/get-absent behave.
+@test
+fn test_put_get_revision(): void {
+    let s = config.ConfigStore();
+    assert.isTrue(s.revision() == 0);
+
+    let r1 = s.put("workloads/web", "spec-a");
+    assert.isTrue(r1 == 1);
+    assert.isTrue(s.revision() == 1);
+
+    let r2 = s.put("workloads/api", "spec-b");
+    assert.isTrue(r2 == 2);
+    assert.isTrue(s.revision() == 2);
+
+    let web = s.get("workloads/web") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(web.value, "spec-a");
+    assert.isTrue(web.revision == 1);
+
+    // Overwrite: value changes, mod-revision advances to the new global revision.
+    let r3 = s.put("workloads/web", "spec-a2");
+    assert.isTrue(r3 == 3);
+    let web2 = s.get("workloads/web") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(web2.value, "spec-a2");
+    assert.isTrue(web2.revision == 3);
+
+    // Absent key: exists() false and get() yields the undefined branch (the ?? default here).
+    assert.isFalse(s.exists("workloads/none"));
+    let miss = s.get("workloads/none") ?? config.ConfigEntry("MISS", "", 0);
+    assert.equalStr(miss.key, "MISS");
+}
+
+// list(prefix) returns exactly the keys under the prefix, in insertion order.
+@test
+fn test_list_prefix(): void {
+    let s = config.ConfigStore();
+    let _1 = s.put("workloads/web", "a");
+    let _2 = s.put("leases/leader", "node-1");
+    let _3 = s.put("workloads/api", "b");
+    let _4 = s.put("workloads/worker", "c");
+
+    let wl = s.list("workloads/");
+    assert.equalInt(wl.size(), 3);
+    // insertion order: web, api, worker (leases/leader is filtered out)
+    assert.equalStr((wl.at(0)).key, "workloads/web");
+    assert.equalStr((wl.at(1)).key, "workloads/api");
+    assert.equalStr((wl.at(2)).key, "workloads/worker");
+
+    let leases = s.list("leases/");
+    assert.equalInt(leases.size(), 1);
+    assert.equalStr((leases.at(0)).value, "node-1");
+
+    assert.equalInt(s.list("nothing/").size(), 0);
+}
+
+// compare-and-set on revision: create-only (expected 0), and update guarded by the current revision.
+@test
+fn test_cas(): void {
+    let s = config.ConfigStore();
+
+    // create-only: expected 0 succeeds when absent, returns the new revision.
+    let c1 = s.cas("leases/leader", "node-1", 0);
+    assert.isTrue(c1 == 1);
+    // create-only again fails: key now exists.
+    let c2 = s.cas("leases/leader", "node-2", 0);
+    assert.isTrue(c2 == -1);
+    // value unchanged after the failed CAS.
+    let cur = s.get("leases/leader") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(cur.value, "node-1");
+
+    // stale-revision update fails (someone else wrote at revision 1, we expected an older one).
+    let stale = s.cas("leases/leader", "node-3", 99);
+    assert.isTrue(stale == -1);
+
+    // correct-revision update succeeds (expected == current revision 1) and advances the revision.
+    let ok = s.cas("leases/leader", "node-1-renewed", 1);
+    assert.isTrue(ok == 2);
+    let renewed = s.get("leases/leader") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(renewed.value, "node-1-renewed");
+    assert.isTrue(renewed.revision == 2);
+}
+
+// del removes the key and bumps the revision (so a watcher sees the store moved on).
+@test
+fn test_delete(): void {
+    let s = config.ConfigStore();
+    let _1 = s.put("workloads/web", "a");
+    let _2 = s.put("workloads/api", "b");
+    assert.isTrue(s.revision() == 2);
+
+    assert.isTrue(s.del("workloads/web"));
+    assert.isFalse(s.exists("workloads/web"));
+    assert.isTrue(s.revision() == 3);        // delete advanced the global revision
+    assert.equalInt(s.list("workloads/").size(), 1);
+
+    // deleting an absent key is a no-op that does not bump the revision.
+    assert.isFalse(s.del("workloads/web"));
+    assert.isTrue(s.revision() == 3);
+}
+
+// watch(prefix, since) yields only the entries written after `since` -- the reconcile catch-up model.
+@test
+fn test_watch_since_revision(): void {
+    let s = config.ConfigStore();
+    let _1 = s.put("workloads/web", "a");     // rev 1
+    let _2 = s.put("workloads/api", "b");     // rev 2
+    let mark = s.revision();                   // 2
+    let _3 = s.put("workloads/worker", "c");  // rev 3
+    let _4 = s.put("workloads/web", "a2");    // rev 4 (update)
+
+    // everything is newer than revision 0
+    assert.equalInt(s.watch("workloads/", 0).size(), 3);
+
+    // only changes strictly after `mark` (rev 2): worker (rev 3) and web (rev 4)
+    let recent = s.watch("workloads/", mark);
+    assert.equalInt(recent.size(), 2);
+    // insertion order: web (updated in place, rev 4) then worker (rev 3)
+    assert.equalStr((recent.at(0)).key, "workloads/web");
+    assert.isTrue((recent.at(0)).revision == 4);
+    assert.equalStr((recent.at(1)).key, "workloads/worker");
+    assert.isTrue((recent.at(1)).revision == 3);
+
+    // a prefix miss yields nothing
+    assert.equalInt(s.watch("leases/", 0).size(), 0);
+}

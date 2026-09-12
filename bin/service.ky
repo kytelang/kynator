@@ -1,0 +1,132 @@
+// service -- the DATA-plane binary of the split orchestrator stack (formerly proxyd).
+//
+// A standalone L7/L4 reverse proxy + load balancer: it owns TRAFFIC, nothing else. It builds a backend
+// Pool from a validated JSON config (static backends and/or a control-plane service-discovery file that
+// kynatord publishes), applies the configured LB strategy + active health checks, and serves forever with
+// the share-nothing per-reactor accept fan-out. In fd-handoff mode it passes client sockets to the app
+// directly (out of the data path). It has no knowledge of workload lifecycle, manifests, or the config
+// store -- that is kynatord's job. The two coordinate ONLY through the discovery file.
+//
+//   service [config.json]       # default: service.json ; or set SERVICE_CONFIG ; KYTE_PORT overrides the port
+import net.proxy;
+import net.service;
+import net.aio;
+import cfg.config;
+import env;
+import string;
+
+// Add EVERY endpoint advertised for the service in the discovery file (written by kynatord each reconcile
+// tick), so the pool tracks all replicas the control plane manages. Active health checks then prune any
+// that are not actually serving yet. Returns how many backends were added.
+fn addDiscovered(pool: proxy.Pool, discoveryFile: string, svc: string): int {
+    if (string.eql(discoveryFile, "")) { return 0; }
+    let eps = service.resolveAllFrom(discoveryFile, svc);
+    let added = 0;
+    let i = 0;
+    while (i < eps.size()) {
+        let hp = string.split(eps.get(i) ?? "", ":");
+        if (hp.size() >= 2) {
+            let host = hp.get(0) ?? "";
+            let port = string.parseI64(hp.get(1) ?? "0") as int;
+            if (!string.eql(host, "") && port > 0) { pool.add(host, port); added = added + 1; }
+        }
+        i = i + 1;
+    }
+    return added;
+}
+
+fn main(): int {
+    let path = config.resolveConfigPath("SERVICE_CONFIG", "service.json");
+    let c = config.loadProxyConfig(path);
+
+    // Port override for parity with the flagship KYTE_PORT convention (many service replicas on one host).
+    let pe = env.get("KYTE_PORT");
+    if (!string.eql(pe, "")) { c.listenPort = string.parseI64(pe) as int; }
+
+    // fd-passing handoff mode (out-of-path, L4-style): the service binds an AF_UNIX rendezvous and hands
+    // accepted client sockets to backend apps that connect to it, instead of forwarding bytes to a
+    // backend Pool. HANDOFF IS THE DEFAULT: it is used whenever an explicit KYTE_HANDOFF_SOCK is set, OR
+    // when no static/discovery backends are configured (a bare `service`). Classic byte-forwarding L7 is
+    // the fallback ONLY when backends are configured. Same-host only; a specific rendezvous path can be
+    // set with KYTE_HANDOFF_SOCK (default /tmp/kyte-service.sock).
+    // Handoff is the default: use it when KYTE_HANDOFF_SOCK is set OR when the config declares no classic
+    // backends (no static list and no discovery file). Classic byte-forwarding L7 is used only when
+    // backends ARE configured. This decision precedes validateProxy, whose "backends required" rule
+    // applies to classic mode only.
+    let handoffEnv = env.get("KYTE_HANDOFF_SOCK");
+    let noBackends = c.backends.size() == 0 && string.eql(c.discoveryFile, "");
+    if (!string.eql(handoffEnv, "") || noBackends) {
+        let sock = if (!string.eql(handoffEnv, "")) handoffEnv else "/tmp/kyte-service.sock";
+        let why = if (!string.eql(handoffEnv, "")) "" else " - default: no static backends";
+        if (config.hasFlag("--check")) {
+            console.log(`service: config OK (fd-handoff via ${sock}, port ${c.listenPort}${why})`);
+            return 0;
+        }
+        console.log(`service: listening on *:${c.listenPort} (fd-handoff via ${sock}${why})`);
+        proxy.serveHandoffOnReactor(c.listenPort, sock, c.timeoutMs);
+        return 0;
+    }
+
+    let err = config.validateProxy(c);
+    if (!string.eql(err, "")) {
+        console.log(`service: invalid config (${path}): ${err}`);
+        return 1;
+    }
+
+    let pool = proxy.Pool();
+    pool.setStrategy(proxy.strategyFromName(c.strategy));
+    if (c.healthChecks) {
+        pool.setHealthPath(c.healthPath);
+        pool.enableHealthChecks(c.healthIntervalMs, c.healthTimeoutMs, c.healthRise, c.healthFall);
+    }
+    let i = 0;
+    while (i < c.backends.size()) {
+        let b = c.backends.get(i) ?? config.BackendCfg("", 0, 1);
+        pool.addWeighted(b.host, b.port, b.weight);
+        i = i + 1;
+    }
+    let _ = addDiscovered(pool, c.discoveryFile, c.discoveryService);
+
+    // Control-plane discovery mode: serve with a live discovery-refresh loop so the backend pool tracks
+    // kynatord's published endpoints as replicas scale up and down (zero manual reconfig). Decided BEFORE
+    // the empty-pool handoff fallback below: with discovery configured the service must start serving even
+    // when the discovery file is momentarily empty (kynatord not up yet, or zero replicas), letting the
+    // refresh loop populate the pool once endpoints appear. Falling into handoff here would strand it.
+    if (!string.eql(c.discoveryFile, "")) {
+        if (config.hasFlag("--check")) {
+            console.log(`service: config OK (${path}), discovery=${c.discoveryService}, strategy=${c.strategy}, ${pool.size()} backend(s) at start`);
+            return 0;
+        }
+        let bindHost0 = if (string.eql(c.listenHost, "")) "*" else c.listenHost;
+        console.log(`service: listening on ${bindHost0}:${c.listenPort}, discovery=${c.discoveryService}, ${pool.size()} backend(s) at start, strategy=${c.strategy}, health=${c.healthChecks}`);
+        proxy.serveOnReactorDiscovery(pool, c.listenPort, c.timeoutMs,
+                                      c.discoveryFile, c.discoveryService, c.discoveryRefreshMs);
+        return 0;
+    }
+
+    // No backends to classically proxy -> handoff is the default (apps connect to the rendezvous), rather
+    // than refusing to start.
+    if (pool.size() == 0) {
+        let sock = "/tmp/kyte-service.sock";
+        if (config.hasFlag("--check")) {
+            console.log(`service: config OK (handoff default - no static backends, socket ${sock}, port ${c.listenPort})`);
+            return 0;
+        }
+        console.log(`service: listening on *:${c.listenPort} (fd-handoff via ${sock} - default: no static backends)`);
+        proxy.serveHandoffOnReactor(c.listenPort, sock, c.timeoutMs);
+        return 0;
+    }
+
+    if (config.hasFlag("--check")) {
+        console.log(`service: config OK (${path}), ${pool.size()} backend(s), strategy=${c.strategy}`);
+        return 0;
+    }
+
+    let bindHost = if (string.eql(c.listenHost, "")) "*" else c.listenHost;
+    console.log(`service: listening on ${bindHost}:${c.listenPort}, ${pool.size()} backend(s), strategy=${c.strategy}, health=${c.healthChecks}`);
+    // Single reactor on this thread (share-nothing per process). serveOnReactor creates + drives the
+    // reactor and blocks forever. To use more cores, run more service instances behind SO_REUSEPORT and
+    // let the orchestrator manage them (the horizontal-scaling model; see the deployment guide).
+    proxy.serveOnReactor(pool, c.listenPort, c.timeoutMs);
+    return 0;
+}

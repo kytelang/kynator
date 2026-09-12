@@ -1,0 +1,105 @@
+// orch/alerts.ky -- O5: turn the HealthReport + per-workload statuses into FIRING ALERTS with
+// severities, so a scrape / alertmanager pipeline (or a structured log tail) keys off thresholds instead
+// of a human eyeballing /metrics. Pure data (no I/O), like health.ky, so it renders and tests without a
+// live dependency. kynatord evaluates these each reconcile tick, folds them into the /metrics file as
+// orch_alert{...} series, and logs the critical ones.
+import orch.health;
+import orch.nativelet;
+import list;
+import string;
+
+// Firing thresholds. A 0 disables that rule (some signals -- replication lag, reconcile latency -- are
+// only meaningful on an HA node and stay off for a standalone kynatord).
+pub struct AlertThresholds {
+    pub crashLoopRestarts: int,       // per-workload cumulative restarts at/above which a crash loop fires
+    pub replicationLagFrames: long,   // follower frames-behind at/above which lag fires (0 = off)
+    pub reconcileLatencyMs: long,     // reconcile tick ms at/above which slow-reconcile fires (0 = off)
+    init() {
+        self.crashLoopRestarts = 5;
+        self.replicationLagFrames = 0;
+        self.reconcileLatencyMs = 0;
+    }
+}
+
+pub struct Alert {
+    pub name: string,
+    pub severity: string,     // "critical" | "warning"
+    pub workload: string,     // "" for node-level alerts
+    pub summary: string,
+    init(name: string, severity: string, workload: string, summary: string) {
+        self.name = name;
+        self.severity = severity;
+        self.workload = workload;
+        self.summary = summary;
+    }
+}
+
+// Evaluate every firing alert from a report + per-workload statuses: node-level first (store/readiness,
+// replication lag, slow reconcile), then per-workload (under-provisioned, crash loop).
+pub fn evaluate(r: health.HealthReport, statuses: list.List<nativelet.WorkloadStatus>, t: AlertThresholds): list.List<Alert> {
+    let out = list.List<Alert>();
+
+    if (!r.storeReachable) {
+        out.push(Alert("OrchStoreUnreachable", "critical", "", "config store round-trip failed"));
+    } else if (!r.ready()) {
+        out.push(Alert("OrchNotReady", "critical", "", `node not ready (role=${r.role})`));
+    }
+    if (t.replicationLagFrames > 0 && r.replicationLag >= t.replicationLagFrames) {
+        out.push(Alert("ReplicationLagHigh", "warning", "", `follower ${r.replicationLag} frames behind`));
+    }
+    if (t.reconcileLatencyMs > 0 && r.reconcileLatencyMs >= t.reconcileLatencyMs) {
+        out.push(Alert("ReconcileSlow", "warning", "", `reconcile took ${r.reconcileLatencyMs}ms`));
+    }
+
+    let i = 0;
+    while (i < statuses.size()) {
+        let s = statuses.get(i) ?? nativelet.WorkloadStatus("", 0, 0, 0);
+        if (s.running < s.desired) {
+            out.push(Alert("WorkloadUnderProvisioned", "warning", s.name, `${s.running}/${s.desired} replicas running`));
+        }
+        if (t.crashLoopRestarts > 0 && s.restarts >= t.crashLoopRestarts) {
+            out.push(Alert("WorkloadCrashLoop", "critical", s.name, `${s.restarts} restarts`));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn firing(alerts: list.List<Alert>): bool { return alerts.size() > 0; }
+
+// Count "critical" alerts -- the page-now signal.
+pub fn criticalCount(alerts: list.List<Alert>): int {
+    let n = 0;
+    let i = 0;
+    while (i < alerts.size()) {
+        if (string.eql((alerts.get(i) ?? Alert("", "", "", "")).severity, "critical")) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Render alerts as Prometheus series so they ride the same /metrics scrape:
+//   orch_alert{name="...",severity="...",workload="..."} 1
+pub fn renderAlertMetrics(alerts: list.List<Alert>): string {
+    let out = "";
+    let i = 0;
+    while (i < alerts.size()) {
+        let a = alerts.get(i) ?? Alert("", "", "", "");
+        out = out + `orch_alert{name="${a.name}",severity="${a.severity}",workload="${a.workload}"} 1` + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+// Render one structured log line per alert (severity-tagged) for a log-based alerting pipeline.
+pub fn renderAlertLines(alerts: list.List<Alert>): string {
+    let out = "";
+    let i = 0;
+    while (i < alerts.size()) {
+        let a = alerts.get(i) ?? Alert("", "", "", "");
+        let wl = if (string.eql(a.workload, "")) "" else ` workload=${a.workload}`;
+        out = out + `[alert severity=${a.severity}] ${a.name}:${wl} ${a.summary}` + "\n";
+        i = i + 1;
+    }
+    return out;
+}

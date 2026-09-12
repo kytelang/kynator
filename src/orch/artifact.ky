@@ -1,0 +1,159 @@
+// orch/artifact.ky -- resolve a workload's content-addressed `artifact` to a local, verified binary.
+//
+// A Spec's `artifact` is "sha256:<hex>". kynatord keeps a per-node BlobStore cache; before it can spawn a
+// replica it must have that exact blob locally. This module is the interface between the manifest's hash and
+// the supervisor's binaryPath:
+//   - resolveBinary: hash -> a local path if cached, else NotCached (the caller pulls, then retries).
+//   - cacheArtifact: verify pulled bytes hash to their name and publish them (Corrupt on mismatch).
+// The actual fetch over HTTP (web.client GET /artifacts/<sha> from the artifact origin) + the exec-bit
+// are the caller's integration step; keeping them out here makes the verify/cache logic unit-testable
+// without a network or a live server.
+import string;
+import list;
+import process;
+import io.file;
+import io.dir;
+import web.client;
+import artifacts.blobstore;
+
+// rwxr-xr-x. The exec bit is what makes a fetched artifact runnable; kynatord OWNS setting it (a blob
+// arrives over HTTP with no mode). 493 == 0o755.
+const EXEC_MODE: int = 493;
+
+pub exception ArtifactError {
+    NotCached(string),      // the blob is not on this node yet -- pull it, then resolve again
+    Corrupt(string),        // fetched bytes did not hash to their claimed sha -- reject, never run
+
+    pub fn message(self: ArtifactError): string {
+        switch (self) {
+            case ArtifactError.NotCached(s): { return "artifact not cached: " + s; }
+            case ArtifactError.Corrupt(s): { return "artifact failed hash verification: " + s; }
+        }
+        return "artifact error";
+    }
+}
+
+// "sha256:<hex>" -> "<hex>"; a bare "<hex>" is returned unchanged. Any other scheme yields "".
+pub fn shaOf(artifact: string): string {
+    if (string.startsWith(artifact, "sha256:")) { return string.slice(artifact, 7, artifact.length); }
+    return artifact;
+}
+
+// Make the file at `path` executable (0o755). kynatord OWNS the exec bit: a blob fetched over HTTP or
+// written by the blob store carries no mode, so a Go/Rust/C#-AOT binary would otherwise fail with EACCES
+// on exec. Idempotent, so it is safe to call on every resolve (fresh pull or a blob cached last run).
+// Returns true on success (or on Windows, where it is a no-op).
+pub fn ensureExecutable(path: string): bool {
+    return File.chmod(path, EXEC_MODE) == 0;
+}
+
+// Resolve a spec to a local executable path. Legacy specs (no artifact) use binaryPath verbatim.
+// A content-addressed spec resolves to the cached blob's path, or NotCached when it must be pulled first.
+// The cached blob is made executable before it is returned (see ensureExecutable) so the supervisor can
+// exec it directly. This is the "single" artifactKind; a tarball uses resolveTarball.
+pub fn resolveBinary(artifact: string, binaryPath: string, cache: blobstore.BlobStore): string | ArtifactError {
+    if (string.eql(artifact, "")) {
+        // Legacy local-path mode: the operator points at a binary already on the node. Still own the exec
+        // bit (best-effort) so a freshly-copied foreign binary need not be pre-chmod'd by hand.
+        let _ = ensureExecutable(binaryPath);
+        return binaryPath;
+    }
+    let sha = shaOf(artifact);
+    if (cache.has(sha)) {
+        let p = cache.localPath(sha);
+        let _ = ensureExecutable(p);
+        return p;
+    }
+    return ArtifactError.NotCached(sha);
+}
+
+// Resolve a TARBALL artifact: the cached blob is a .tar whose contents are extracted into `workdir`
+// (created if needed), after which the workload's (relative) binaryPath resolves against that directory.
+// Returns the workload's cwd (workdir) on success - the supervisor spawns binaryPath with cwd=workdir -
+// or NotCached when the blob must be pulled first. The extracted entry point is made executable.
+// Extraction shells out to the system `tar` (universally present on the POSIX hosts kynatord supervises);
+// re-extracting an already-populated workdir is harmless (tar overwrites), so this is safe to retry.
+pub fn resolveTarball(artifact: string, binaryPath: string, workdir: string,
+                      cache: blobstore.BlobStore): string | ArtifactError {
+    if (string.eql(artifact, "")) { return ArtifactError.Corrupt("tarball artifact requires a sha"); }
+    let sha = shaOf(artifact);
+    if (!cache.has(sha)) { return ArtifactError.NotCached(sha); }
+    let tarPath = cache.localPath(sha);
+    let _ = Dir.create(workdir, 493);                            // 0o755; no-op/failure ignored if it exists
+    let args = list.List<string>();
+    args.push("-xf");
+    args.push(tarPath);
+    args.push("-C");
+    args.push(workdir);
+    let p = process.Process.spawn("tar", args);
+    let rc = p.wait();
+    p.close();
+    if (rc != 0) { return ArtifactError.Corrupt("tar extraction failed for " + sha); }
+    // Make the declared entry point executable inside the extraction dir (binaryPath is relative to it).
+    let _ = ensureExecutable(workdir + "/" + binaryPath);
+    return workdir;
+}
+
+// Verify + publish freshly-fetched bytes into the cache, returning the local path. The BlobStore rejects
+// bytes that do not hash to `sha`, so a corrupt or tampered download can never become a runnable file.
+pub fn cacheArtifact(cache: blobstore.BlobStore, sha: string, data: string): string | ArtifactError {
+    if (!cache.put(sha, data)) { return ArtifactError.Corrupt(sha); }
+    return cache.localPath(sha);
+}
+
+// --- content-addressed delivery: pull a blob by hash, then resolve to a runnable local path ----------
+// These bool/"" -returning helpers are the daemon integration point (kynatord reconcile). They avoid the
+// exception-union so the reconcile loop can act on a simple success/failure without try/catch.
+
+// Fetch the blob named `sha` from the artifact origin (`GET <originBase>/artifacts/<sha>`, bearer-guarded)
+// and publish it into `cache`. BlobStore.put re-verifies the bytes hash to `sha`, so a corrupt or tampered
+// download is rejected and never cached. Returns true only when the blob is now cached and verified.
+pub fn pullArtifact(originBase: string, token: string, sha: string, cache: blobstore.BlobStore): bool {
+    let h = client.Http.emptyHeaders();
+    if (!string.eql(token, "")) { h.set("Authorization", "Bearer " + token); }
+    let r = client.Http.request("GET", originBase + "/artifacts/" + sha, h, "");
+    if (r.status.toCode() != 200) { return false; }
+    return cache.put(sha, r.body);   // put fails (false) if r.body does not hash to sha
+}
+
+// Extract a `.tar` blob at `tarPath` into `workdir` (created if needed) and make the (relative) entry
+// point executable. Returns true on success. Shells out to the system `tar` (present on the POSIX hosts
+// kynatord supervises); re-extracting an already-populated workdir is harmless.
+pub fn extractTarballOk(tarPath: string, workdir: string, binaryPath: string): bool {
+    let _ = Dir.create(workdir, EXEC_MODE);
+    let args = list.List<string>();
+    args.push("-xf"); args.push(tarPath); args.push("-C"); args.push(workdir);
+    let p = process.Process.spawn("tar", args);
+    let rc = p.wait();
+    p.close();
+    if (rc != 0) { return false; }
+    let _ = ensureExecutable(workdir + "/" + binaryPath);
+    return true;
+}
+
+// Resolve a spec's binary to a runnable LOCAL path, pulling the content-addressed artifact by hash first
+// if it is not already cached. Returns the path the supervisor should spawn (for a tarball, the workdir),
+// or "" on any failure so the caller can degrade (keep the last-good workload, retry next tick):
+//   - no artifact  -> own the exec bit on the given local binaryPath and return it (legacy/local mode)
+//   - artifact set, cached -> return the cached blob's path (exec-bit owned)
+//   - artifact set, NOT cached -> pull from originBase (needs a non-empty origin), verify, cache, return
+//   - tarball -> extract into workdir and return workdir (binaryPath stays relative to it)
+pub fn resolveOrPull(artifact: string, binaryPath: string, artifactKind: string, workdir: string,
+                     originBase: string, token: string, cache: blobstore.BlobStore): string {
+    if (string.eql(artifact, "")) {
+        let _ = ensureExecutable(binaryPath);      // local path already on the node
+        return binaryPath;
+    }
+    let sha = shaOf(artifact);
+    if (!cache.has(sha)) {
+        if (string.eql(originBase, "")) { return ""; }         // artifact set but nowhere to pull from
+        if (!pullArtifact(originBase, token, sha, cache)) { return ""; }
+    }
+    if (string.eql(artifactKind, "tarball")) {
+        if (!extractTarballOk(cache.localPath(sha), workdir, binaryPath)) { return ""; }
+        return workdir;
+    }
+    let p = cache.localPath(sha);
+    let _ = ensureExecutable(p);
+    return p;
+}

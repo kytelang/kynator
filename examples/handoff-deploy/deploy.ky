@@ -1,0 +1,37 @@
+// kynatord-style handoff deployment, end to end: from ONE manifest, launch the workload's SERVICE (gateway)
+// and its APP replicas, both in fd-handoff mode on the same rendezvous, via supervisors - exactly what
+// kynatord's reconcile does. The service binds the front port + rendezvous; the apps connect and receive
+// client sockets. Prove it by curling the front port. Args: <webappBinary> <serviceBinary>.
+import orch.manifest;
+import orch.supervisor;
+import env;
+import list;
+import os.sys;
+
+fn main(): int {
+    let a = env.args();
+    let webapp = a.get(1) ?? "";
+    let service = a.get(2) ?? "";
+    if (webapp == "" || service == "") { console.log("usage: deploy <webappBinary> <serviceBinary>"); return 1; }
+
+    let yaml = "metadata:\n  name: shop\n" +
+               "workload:\n  binary: " + webapp + "\n" +
+               "replicas:\n  min: 2\n  max: 4\n" +
+               "network:\n  servicePort: 8140\n";   // lb.handoff + gateway-only are the defaults
+    let m = manifest.parseManifest(yaml);
+
+    // Service first (binds the AF_UNIX rendezvous + the front port), then the apps (they connect to it).
+    let svc = supervisor.Supervisor(manifest.serviceSpecFor(m, service));
+    svc.start();
+    let apps = supervisor.Supervisor(manifest.toSpec(m));
+    apps.start();
+
+    console.log("deployed 'shop': service on :8140 (handoff /tmp/kyte-shop.sock) + 2 app replicas");
+    // Stay alive like kynatord's reconcile loop (poll the supervisors), keeping the children supervised.
+    while (true) {
+        sys.ky_sleep_ms(1000);
+        svc.poll();
+        apps.poll();
+    }
+    return 0;
+}

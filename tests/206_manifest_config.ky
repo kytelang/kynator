@@ -1,0 +1,39 @@
+// 206 -- content-addressed workload manifest: workload.artifact ("sha256:<hex>") lowers to spec.artifact
+// so kynatord pulls the binary by hash. (The app's own `config:` section is NOT modelled by the
+// orchestrator any more -- it is read by the application itself from the manifest via the framework
+// loader web.config, never injected as env. So there is nothing config-related to test on the orch side.)
+import assert;
+import string;
+import orch.manifest;
+import orch.spec;
+
+@test
+fn test_manifest_artifact_lowers_to_spec(): void {
+    let text =
+        "apiVersion: kyte/v1\n" +
+        "kind: App\n" +
+        "metadata:\n  name: webapp\n" +
+        "workload:\n  artifact: sha256:deadbeef\n  restartPolicy: always\n" +
+        "replicas:\n  min: 1\n  max: 1\n";
+    let m = manifest.parseManifest(text);
+    assert.equalStr(m.workload.artifact, "sha256:deadbeef");
+    assert.equalStr(manifest.validateManifest(m), "");     // artifact satisfies the binary-or-artifact rule
+    let s = manifest.toSpec(m);
+    assert.equalStr(s.artifact, "sha256:deadbeef");
+}
+
+@test
+fn test_manifest_ignores_app_config_section(): void {
+    // A manifest carrying the app's `config:` section still binds cleanly -- kynatord ignores that key.
+    let text =
+        "apiVersion: kyte/v1\n" +
+        "kind: App\n" +
+        "metadata:\n  name: webapp\n" +
+        "workload:\n  binary: ./bin/webapp\n  restartPolicy: always\n" +
+        "replicas:\n  min: 1\n  max: 1\n" +
+        "config:\n  db:\n    dsn: postgres://x\n    poolSize: 8\n";
+    let m = manifest.parseManifest(text);
+    assert.equalStr(manifest.validateManifest(m), "");
+    assert.equalStr(m.metadata.name, "webapp");
+    assert.equalStr(m.workload.binary, "./bin/webapp");
+}

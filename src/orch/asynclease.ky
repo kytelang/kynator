@@ -1,0 +1,182 @@
+// orch/asynclease.ky -- the leader lease over the ASYNC SqlConfigStore (P3 live path).
+//
+// Same fencing-epoch policy as orch/lease.ky's LeaderLease, but its store operations are `await`ed
+// against BTreeDB through the database interface, so it drives REAL orchestrator nodes: each node holds its own
+// SqlConfigStore (its own connection) over the SAME btree, and they contend for one lease row via the
+// store's compare-and-set. The lease encoding ("holder|epoch|deadlineMs") is shared with the sync sibling
+// (lease.encodeLease/decodeLease). Safety still rests on the epoch (CAS = one winner per epoch), not
+// clocks; time is only for liveness. See lease.ky for the full rationale.
+
+import store.config;
+import store.httpconfig;
+import orch.lease;
+import orch.nativelet;
+import string;
+import list;
+
+pub struct AsyncLeaderLease {
+    pub store: httpconfig.HttpConfigStore,
+    pub nodeId: string,
+    pub key: string,
+    pub ttlMs: long,
+    pub myEpoch: long,      // the epoch this node currently holds (0 when not leader)
+    pub isLeader: bool,
+    pub storeReachable: bool, // reachability observed on the last reconcile tick (for /readyz)
+
+    init(store: httpconfig.HttpConfigStore, nodeId: string, key: string, ttlMs: long) {
+        self.store = store;
+        self.nodeId = nodeId;
+        self.key = key;
+        self.ttlMs = ttlMs;
+        self.myEpoch = 0;
+        self.isLeader = false;
+        self.storeReachable = true;
+    }
+
+    // The role this node reports right now: "leader" while it holds the lease, "standby" otherwise.
+    // Reachability is a separate axis carried on the HealthReport (storeReachable), and it is what
+    // makes /readyz report not-ready when the store is down, regardless of role. A leader that loses
+    // the store has already had isLeader cleared (renew/stillLeader step it down), so it reports
+    // "standby" + storeReachable=false rather than a stale "leader".
+    pub fn roleName(self: AsyncLeaderLease): string {
+        if (self.isLeader) { return "leader"; }
+        return "standby";
+    }
+
+    // Try to become leader: CAS-create when the lease is free, CAS-on-revision takeover when expired (or
+    // ours), epoch bumped each takeover; stay standby if another node holds a live lease. Returns whether
+    // this node holds the lease after the call.
+    // C-T2-2 (F-2): the quorum gate, previously dead code. Every configured member row lives under the
+    // "members/" prefix in the shared store, so a node that can read the store sees the whole configured
+    // set; a node partitioned away from the store cannot list() at all and so cannot pass this gate or run
+    // the CAS. When members ARE configured, only a registered member may take the lease (a stray node
+    // cannot hijack it), and the reachable count must meet N/2+1. When NO members are registered the
+    // cluster is in single-kynatord / legacy mode (the slice does not register membership) and election is
+    // allowed unchanged. The CAS (one winner per epoch) remains the primary split-brain arbiter; this gate
+    // is defence in depth for the multi-kynatord topology.
+    async fn hasQuorum(self: AsyncLeaderLease): bool {
+        let mem = await self.store.list("members/");
+        // A store we cannot reach reads back as an EMPTY member list, which must NOT be
+        // mistaken for "membership not configured, single-node mode". If the store is
+        // unreachable we cannot confirm a quorum, so we do not hold one.
+        if (!self.store.reachable) { return false; }
+        let n = mem.size();
+        if (n == 0) { return true; }                 // membership not configured -> single-node mode
+        let q = n / 2 + 1;
+        if (n < q) { return false; }                 // fewer than a majority reachable via the store
+        return await self.store.exists("members/" + self.nodeId); // must be a registered member
+    }
+
+    pub async fn tryAcquire(self: AsyncLeaderLease, nowMs: long): bool {
+        if (!(await self.hasQuorum())) { self.isLeader = false; return false; }
+        let has = await self.store.exists(self.key);
+        if (!has) {
+            let val = lease.encodeLease(self.nodeId, 1, nowMs + self.ttlMs);
+            let r = await self.store.cas(self.key, val, 0);       // create-only
+            if (r >= 0) {
+                self.myEpoch = 1;
+                self.isLeader = true;
+                await self.store.setWriteEpoch(1);               // link: raise the store write-fence
+                return true;
+            }
+            return false;
+        }
+        let cur = await self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = lease.decodeLease(cur.value);
+        let mine = string.eql(st.holder, self.nodeId);
+        if (nowMs < st.deadlineMs && !mine) {
+            self.isLeader = false;                                // another node holds a LIVE lease
+            return false;
+        }
+        let newEpoch = st.epoch + 1;
+        let val = lease.encodeLease(self.nodeId, newEpoch, nowMs + self.ttlMs);
+        let r = await self.store.cas(self.key, val, cur.revision);
+        if (r >= 0) {
+            self.myEpoch = newEpoch;
+            self.isLeader = true;
+            await self.store.setWriteEpoch(newEpoch);            // link: raise the store write-fence
+            return true;
+        }
+        return false;                                            // lost the takeover race
+    }
+
+    // Extend our lease iff the store still shows US as holder at OUR epoch; a newer epoch means FENCED.
+    pub async fn renew(self: AsyncLeaderLease, nowMs: long): bool {
+        if (!self.isLeader) { return false; }
+        let has = await self.store.exists(self.key);
+        if (!has) { self.isLeader = false; return false; }
+        let cur = await self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = lease.decodeLease(cur.value);
+        if (!string.eql(st.holder, self.nodeId) || st.epoch != self.myEpoch) {
+            self.isLeader = false;                                // FENCED: a newer epoch owns the lease
+            return false;
+        }
+        let val = lease.encodeLease(self.nodeId, self.myEpoch, nowMs + self.ttlMs);
+        let r = await self.store.cas(self.key, val, cur.revision);
+        if (r >= 0) { return true; }
+        self.isLeader = false;
+        return false;
+    }
+
+    // Still the valid leader: store shows us as holder, at our epoch, unexpired.
+    pub async fn stillLeader(self: AsyncLeaderLease, nowMs: long): bool {
+        if (!self.isLeader) { return false; }
+        let has = await self.store.exists(self.key);
+        if (!has) { self.isLeader = false; return false; }
+        let cur = await self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = lease.decodeLease(cur.value);
+        if (!string.eql(st.holder, self.nodeId) || st.epoch != self.myEpoch || nowMs >= st.deadlineMs) {
+            self.isLeader = false;
+            return false;
+        }
+        return true;
+    }
+
+    // The epoch currently recorded in the store's lease row (0 if absent). The fencing high-water mark.
+    pub async fn currentEpoch(self: AsyncLeaderLease): long {
+        let has = await self.store.exists(self.key);
+        if (!has) { return 0; }
+        let cur = await self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        return lease.decodeLease(cur.value).epoch;
+    }
+
+    // The identity currently holding the store's lease row ("" if absent). The observability read-out for the
+    // "leader identity" metric; safety still rests on the epoch, this is display only.
+    pub async fn currentHolder(self: AsyncLeaderLease): string {
+        let has = await self.store.exists(self.key);
+        if (!has) { return ""; }
+        let cur = await self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        return lease.decodeLease(cur.value).holder;
+    }
+
+    // One HA reconcile tick over the LIVE store -- the async sibling of LeaderLease.haReconcileTick, and the
+    // ACTUATION half of P3 (safety is the lease/fencing above). Refresh (or try to take) leadership, and
+    // ONLY if we are the valid leader read the desired workloads straight from the store
+    // (`await self.store.list(prefix)`) and converge the nativelet toward them. A standby -- or a fenced old
+    // leader -- returns before the fetch and never touches workloads (read-only until promoted), so exactly
+    // one node drives the fleet at a time across live nodes. The store read is the daemon's own async fetch
+    // (unlike the sync sibling, which is handed pre-fetched entries), so this method is self-contained.
+    // Returns whether this node acted as leader this tick.
+    pub async fn haReconcileTick(self: AsyncLeaderLease, n: nativelet.Nativelet, prefix: string, nowMs: long): bool {
+        if (self.isLeader) {
+            let _ = await self.renew(nowMs);
+        } else {
+            let _ = await self.tryAcquire(nowMs);
+        }
+        // Degraded-store guard: if the round-trips above could not reach the store, step down
+        // (do not keep believing we are leader) and return without reading/converging desired
+        // state. Reconciling from an empty read of a dead store would drive every workload to
+        // "not desired" and tear the fleet down. storeReachable feeds /readyz -> not ready.
+        self.storeReachable = self.store.reachable;
+        if (!self.storeReachable) {
+            self.isLeader = false;
+            return false;
+        }
+        if (!await self.stillLeader(nowMs)) {
+            return false;                                     // standby / fenced: read-only, do not reconcile
+        }
+        let entries = await self.store.list(prefix);
+        n.reconcileFromEntries(entries, prefix);
+        return true;
+    }
+}

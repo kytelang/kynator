@@ -1,0 +1,170 @@
+// 180 - I1 PID-controller autoscaling: the pure, offline-testable core. The PidController KATs pin its
+// step response, anti-windup, output clamp, and derivative; the Autoscaler tests pin pre-registration,
+// scale up/down slot management, and the load→replica decision - all with manageProcesses=false so no
+// real backend processes are spawned. The live spawn/kill loop is proven end-to-end separately.
+import assert;
+import math;
+import net.autoscale;
+import net.proxy;
+
+fn near(a: double, b: double): bool { return math.fabs(a - b) < 0.0001; }
+
+// Proportional step response (reverse-acting default: error = setpoint − measured).
+@test
+fn test_pid_proportional_step(): void {
+    let pid = autoscale.PidController(2.0, 0.0, 0.0, 100.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 200.0));    // error 100 · Kp 2
+    assert.isTrue(near(pid.update(100.0, 1.0), 0.0));    // on setpoint → 0
+    assert.isTrue(near(pid.update(150.0, 1.0), -100.0)); // overshoot → negative
+}
+
+// Integral accumulates over time AND is clamped for anti-windup (integral can't exceed iMax even under a
+// sustained error the output can never clear).
+@test
+fn test_pid_integral_antiwindup(): void {
+    let pid = autoscale.PidController(0.0, 1.0, 0.0, 10.0);
+    pid.setIntegralLimits(0.0, 5.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));      // integral 10 clamped to 5
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));      // stays clamped (no windup)
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));
+}
+
+// Output is clamped to the configured range (the replica band).
+@test
+fn test_pid_output_clamp(): void {
+    let pid = autoscale.PidController(1.0, 0.0, 0.0, 0.0);
+    pid.setDirectActing(true);                            // error = measured − setpoint
+    pid.setOutputLimits(1.0, 4.0);
+    assert.isTrue(near(pid.update(100.0, 1.0), 4.0));    // huge positive → clamp hi
+    assert.isTrue(near(pid.update(-100.0, 1.0), 1.0));   // huge negative → clamp lo
+}
+
+// Derivative reacts to the RATE of error change; dt<=0 skips it (no divide-by-zero on the first tick).
+@test
+fn test_pid_derivative_and_zero_dt(): void {
+    let pid = autoscale.PidController(0.0, 0.0, 1.0, 0.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 0.0));      // error 0, no change
+    assert.isTrue(near(pid.update(10.0, 1.0), -10.0));   // error −10, d(error)/dt = −10
+    let pid2 = autoscale.PidController(0.0, 0.0, 1.0, 0.0);
+    assert.isTrue(near(pid2.update(5.0, 0.0), 0.0));     // dt=0 → derivative skipped, no trap
+}
+
+// The autoscaler pre-registers maxReplicas pool slots, ALL drained (invisible to LB until scaled in).
+@test
+fn test_autoscaler_pre_registers_drained(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+    assert.equalInt(pool.size(), 4);
+    assert.equalInt(a.current, 0);
+    let i = 0;
+    while (i < 4) {
+        assert.equalInt((pool.backends.get(i) ?? proxy.Backend("", 0)).up, 0);
+        i = i + 1;
+    }
+    // all drained → LB has nothing → port-0 sentinel
+    assert.equalInt(pool.select("").port, 0);
+}
+
+// scaleTo brings the first N slots into rotation and drains the rest; start() spawns the minimum.
+@test
+fn test_autoscaler_scale_up_down(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+
+    a.start();                                            // → minReplicas = 1
+    assert.equalInt(a.current, 1);
+    assert.equalInt((pool.backends.get(0) ?? proxy.Backend("", 0)).up, 1);
+    assert.equalInt((pool.backends.get(1) ?? proxy.Backend("", 0)).up, 0);
+
+    a.scaleTo(3);                                         // grow to 3
+    assert.equalInt(a.current, 3);
+    assert.equalInt((pool.backends.get(2) ?? proxy.Backend("", 0)).up, 1);
+    assert.equalInt((pool.backends.get(3) ?? proxy.Backend("", 0)).up, 0);
+
+    a.scaleTo(1);                                         // shrink back to 1
+    assert.equalInt(a.current, 1);
+    assert.equalInt((pool.backends.get(1) ?? proxy.Backend("", 0)).up, 0);
+    assert.equalInt((pool.backends.get(2) ?? proxy.Backend("", 0)).up, 0);
+}
+
+// scaleTo clamps to [minReplicas, maxReplicas].
+@test
+fn test_autoscaler_scale_clamps(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 2, 5);
+    a.manageProcesses = false;
+    a.scaleTo(99);
+    assert.equalInt(a.current, 5);                        // clamped to max
+    a.scaleTo(0);
+    assert.equalInt(a.current, 2);                        // clamped to min
+}
+
+// decide() turns a load sample into a clamped replica count via the PID.
+@test
+fn test_autoscaler_decide(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+    // Kp 0.5, setpoint 10, direct-acting: load 30 → error 20 → out 10 → clamp[1,4] = 4
+    a.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a.decide(30.0, 1.0), 4);
+    // load 12 → error 2 → out 1.0 → clamp = 1
+    let a2 = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9200, 1, 4);
+    a2.manageProcesses = false;
+    a2.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a2.decide(12.0, 1.0), 1);            // round(1.0)=1
+    // load 16 → error 6 → out 3.0 → 3
+    let a3 = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9300, 1, 4);
+    a3.manageProcesses = false;
+    a3.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a3.decide(16.0, 1.0), 3);
+}
+
+// The CPU signal is PER-REPLICA (mean of each replica's own core-fraction), not an aggregate sum, and is
+// compared to a PER-REPLICA setpoint. avgCpuUtil takes one cumulative usage_usec sample per replica and
+// deltas it over the interval; the first (warm-up) sample has no baseline so it reads 0.
+@test
+fn test_cpu_signal_is_per_replica_average(): void {
+    let a = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9400, 1, 6);
+    a.manageProcesses = false;
+    a.scaleTo(2);                                     // two live replicas
+    a.setCpuTarget("web", 0.5);                       // 50% of one core, PER replica
+
+    let s0 = list.List<long>(); s0.push(0 as long); s0.push(0 as long);
+    assert.isTrue(near(a.avgCpuUtil(s0, 1.0), 0.0));  // warm-up: no baseline yet → 0
+
+    // Over the next second replica 0 burns 0.5 core, replica 1 burns 1.5 core → mean per-replica util = 1.0
+    // (NOT the sum 2.0). This is the per-replica signal.
+    let s1 = list.List<long>(); s1.push(500000 as long); s1.push(1500000 as long);
+    assert.isTrue(near(a.avgCpuUtil(s1, 1.0), 1.0));
+}
+
+// decideCpu is the HPA ratio ceil(current · avgUtil / setpoint) clamped to the band - and it is STABLE under
+// replica-count doubling at fixed per-replica load, which an aggregate-sum signal could never be.
+@test
+fn test_cpu_decision_is_ratio_and_scale_stable(): void {
+    let a = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9500, 1, 8);
+    a.manageProcesses = false;
+    a.setCpuTarget("web", 0.5);
+
+    a.scaleTo(2);
+    assert.equalInt(a.decideCpu(1.0), 4);             // ceil(2 · 1.0 / 0.5) = 4 (each replica at 2× target)
+    a.scaleTo(4);
+    assert.equalInt(a.decideCpu(0.5), 4);             // per-replica load now AT target → hold at 4 (stable)
+    a.scaleTo(4);
+    assert.equalInt(a.decideCpu(0.25), 2);            // half the target → ceil(4 · 0.25/0.5) = 2 (scale in)
+}
+
+// Unarmed (no cgroup prefix / non-Linux) the CPU path is an inert no-op: no per-replica samples, and a tick
+// holds the current count rather than thrashing.
+@test
+fn test_cpu_path_inert_without_cgroups(): void {
+    let a = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9600, 1, 4);
+    a.manageProcesses = false;
+    a.scaleTo(3);
+    assert.equalInt(a.readPerReplicaUsec().size(), 0);   // unarmed → no samples
+    a.tickCpu(1.0);
+    assert.equalInt(a.current, 3);                       // avgUtil 0 → held (never scaled to min on noise)
+}

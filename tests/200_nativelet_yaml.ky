@@ -1,0 +1,80 @@
+// 200 - the YAML-manifest cutover: nativelet.scan reads declarative *.yaml manifests off disk (via
+// manifest.parseManifest -> validateManifest -> toSpec) alongside legacy *.json specs. A gateway-only app
+// with lb.handoff (the default) lowers to a handoff Spec; a manifest missing a required field is marked
+// invalid (kept out of a reconcile, exactly like an unreadable manifest); a *.json spec still parses.
+import assert;
+import string;
+import list;
+import io.dir;
+import io.file;
+import orch.nativelet;
+import orch.spec;
+
+fn manifestByKey(ms: list.List<nativelet.ScanEntry>, key: string): nativelet.ScanEntry {
+    let i = 0;
+    while (i < ms.size()) {
+        let m = ms.get(i) ?? nativelet.ScanEntry("", spec.Spec("", ""), false);
+        if (string.eql(m.key, key)) { return m; }
+        i = i + 1;
+    }
+    return nativelet.ScanEntry("", spec.Spec("", ""), false);   // not-found sentinel (empty key)
+}
+
+@test
+fn test_scan_reads_yaml_and_json(): void {
+    let dirPath = "/tmp/kyte_yaml_scan_test";
+    let _ = dir.Dir.create(dirPath, 493);   // 0o755; no-op if it already exists
+
+    // A declarative YAML manifest: gateway-only + default handoff.
+    let yaml = "apiVersion: kyte/v1\n"
+        + "kind: App\n"
+        + "metadata:\n"
+        + "  name: shop\n"
+        + "workload:\n"
+        + "  binary: /bin/shop\n"
+        + "  restartPolicy: always\n"
+        + "replicas:\n"
+        + "  min: 3\n"
+        + "  max: 6\n"
+        + "lb:\n"
+        + "  strategy: roundrobin\n"
+        + "  handoff: true\n"
+        + "network:\n"
+        + "  expose: gateway-only\n"
+        + "  servicePort: 8140\n";
+    file.File.writeText(dirPath + "/shop.yaml", yaml);
+
+    // A manifest missing workload.binary -> validateManifest fails -> valid == false.
+    let bad = "apiVersion: kyte/v1\nkind: App\nmetadata:\n  name: broken\n";
+    file.File.writeText(dirPath + "/broken.yaml", bad);
+
+    // A legacy JSON spec still works.
+    file.File.writeText(dirPath + "/legacy.json",
+        "{\"name\":\"legacy\",\"binaryPath\":\"/bin/legacy\",\"replicas\":2}");
+
+    let n = nativelet.Nativelet(dirPath);
+    let ms = n.scan();
+
+    // The YAML app lowered correctly.
+    let shop = manifestByKey(ms, "shop");
+    assert.equalStr(shop.key, "shop");
+    assert.isTrue(shop.valid);
+    assert.equalStr(shop.spec.name, "shop");
+    assert.equalStr(shop.spec.binaryPath, "/bin/shop");
+    assert.equalInt(shop.spec.replicas, 3);                 // replicas.min is the initial desired count
+    assert.isTrue(shop.spec.handoff);                       // lb.handoff default -> handoff data path
+    assert.equalStr(shop.spec.handoffSock, "/tmp/kyte-shop.sock");
+    assert.equalInt(shop.spec.servicePort, 8140);
+
+    // The invalid manifest is present but not applyable.
+    let broken = manifestByKey(ms, "broken");
+    assert.equalStr(broken.key, "broken");
+    assert.isTrue(!broken.valid);
+
+    // The legacy JSON spec still parses.
+    let legacy = manifestByKey(ms, "legacy");
+    assert.equalStr(legacy.key, "legacy");
+    assert.isTrue(legacy.valid);
+    assert.equalInt(legacy.spec.replicas, 2);
+    assert.isTrue(!legacy.spec.handoff);
+}

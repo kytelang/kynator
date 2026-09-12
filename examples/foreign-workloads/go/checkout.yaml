@@ -1,0 +1,19 @@
+apiVersion: kyte/v1
+kind: App
+metadata:
+  name: checkout-go
+workload:
+  workloadType: foreign
+  binary: ./go/app           # built by ../build.sh; give an absolute path for a real deploy
+  restartPolicy: always
+  portEnv: PORT              # the Go server reads $PORT
+  env:
+    - FOO=go-env
+replicas:
+  min: 2
+  max: 2
+network:
+  expose: gateway-only
+  portBase: 18190
+health:
+  probeType: tcp

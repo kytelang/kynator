@@ -1,0 +1,52 @@
+// 184 - manifest -> Pool + Autoscaler wiring. The declarative manifest configures the data-plane LB
+// (strategy + health policy) and the control-plane autoscaler (replica band + target), so
+// one YAML document drives the whole loop, not just the process count. Offline (manageProcesses off via
+// decide(), which is pure); the Autoscaler ctor pre-registers the pool slots without spawning.
+import assert;
+import string;
+import orch.manifest;
+import net.autoscale;
+
+fn yaml(): string {
+    return "metadata:\n  name: shop\n" +
+           "workload:\n  binary: ./bin/webapp\n" +
+           "replicas:\n  min: 2\n  max: 6\n" +
+           "autoscale:\n  enabled: true\n  metric: inflight\n  target: 8\n  intervalMs: 2000\n" +
+           "lb:\n  strategy: leastconn\n  handoff: false\n" +
+           "health:\n  path: /healthz\n  intervalMs: 2000\n  timeoutMs: 1000\n  rise: 2\n  fall: 3\n" +
+           "network:\n  expose: public\n  portBase: 9000\n  portFlag: --port\n";
+}
+
+@test
+fn test_pool_from_manifest_wires_health(): void {
+    let m = manifest.parseManifest(yaml());
+    let p = manifest.poolFrom(m);
+    assert.isTrue(p.hcEnabled);            // health checks turned on from the manifest
+    assert.equalStr(p.hcPath, "/healthz");
+    assert.equalInt(p.hcRise, 2);
+    assert.equalInt(p.hcFall, 3);
+    assert.equalInt(p.hcIntervalMs, 2000);
+}
+
+@test
+fn test_autoscaler_from_manifest_band_and_target(): void {
+    let m = manifest.parseManifest(yaml());
+    let p = manifest.poolFrom(m);
+    let a = manifest.autoscalerFrom(m, p, "127.0.0.1");
+    assert.equalInt(a.minReplicas, 2);
+    assert.equalInt(a.maxReplicas, 6);
+    assert.isTrue(a.pid.setpoint > 7.9 && a.pid.setpoint < 8.1);   // target 8 lowered onto the PID setpoint
+    assert.isTrue(a.pid.kp > 0.49 && a.pid.kp < 0.51);             // fixed internal gain (not a manifest knob)
+    // The Autoscaler ctor pre-registers replicas.max drained slots into the pool.
+    assert.equalInt(p.size(), 6);
+}
+
+@test
+fn test_autoscaler_decisions_from_manifest(): void {
+    let m = manifest.parseManifest(yaml());
+    let p = manifest.poolFrom(m);
+    let a = manifest.autoscalerFrom(m, p, "127.0.0.1");
+    // Direct-acting, target 8, fixed internal kp 0.5: a big overshoot clamps to max; well under clamps to min.
+    assert.equalInt(a.decide(100.0, 1.0), 6);   // load 100 -> clamp max
+    assert.equalInt(a.decide(0.0, 1.0), 2);     // load 0   -> clamp min
+}

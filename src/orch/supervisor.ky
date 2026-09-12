@@ -1,0 +1,446 @@
+// orch/supervisor.ky - keeps ONE workload's replica set running (I2 native orchestrator).
+//
+// A Supervisor owns N replica processes for a Spec. It is driven by the nativelet's reconcile loop (no
+// per-supervisor thread, unlike the Zig PoC): every tick, `poll()` reaps exited replicas and restarts
+// them per the Spec's restart policy, and `ensureReplicas()` tops up / trims to the desired count.
+// Non-blocking throughout - it uses Process.tryWait (waitpid WNOHANG), never the blocking wait, so a
+// single async reconcile coroutine can supervise many workloads. Graceful stop is SIGTERM → brief grace
+// → SIGKILL.
+
+import process;
+import list;
+import string;
+import datetime;
+import orch.spec;
+import orch.secrets;
+import orch.isolation;
+import os.sandbox;
+import net.netns;
+import env;
+import io.file;
+
+// T1-3 graceful-drain window: how long (ms) a replica is given to finish in-flight requests and exit on
+// SIGTERM before it is SIGKILLed. A generous default for a fast web app; a stop returns the instant the
+// process exits, so this is only an upper bound on an app that ignores SIGTERM. Lift to spec.Spec for a
+// per-workload override when a rolling-update controller (T1-1) needs it.
+const TERMINATION_GRACE_MS: long = 3000;
+
+// Supervisor is a CLASS (reference type), not a value struct: it is a long-lived, identity-bearing entity
+// that is mutated IN PLACE (start/poll/rollOne/stopAll all push/remove on self.procs and expect the change
+// to persist), and it is STORED BY VALUE inside the `Job` class. A value struct holding an owned container
+// (procs/ports/simReplicas) that is passed by value into a class constructor was copied WITHOUT deep-retaining
+// those container fields, so the constructor argument's destructor freed `procs` out from under the stored
+// copy -- a later `procs.size()` (e.g. reconcile's stopAll on a removed workload) then read a dangling list
+// and segfaulted. Reference semantics are both the correct model here and the fix.
+pub class Supervisor {
+    pub spec: spec.Spec,
+    pub procs: list.List<process.Process>,  // live replica processes
+    // Port assigned to each live replica (parallel to procs; -1 = none). When spec.basePort > 0 and
+    // spec.portFlag is set, each replica is spawned with a DISTINCT port from [basePort, ...] so the
+    // endpoints kynatord advertises are actually served. Kept in lockstep with procs on spawn/reap/kill.
+    pub ports: list.List<int>,
+    // Per-replica netns /30 slot (parallel to procs; empty unless spec.netns). Each live replica owns a
+    // network namespace + veth pair identified by its slot; kept in lockstep with procs on spawn/kill.
+    pub netnsSlots: list.List<int>,
+    // Rolling count of restarts performed (observability / test signal).
+    pub restarts: int,
+    // When false (tests), the lifecycle methods manipulate no real processes - they no-op so the pure
+    // policy logic can be exercised without spawning binaries.
+    pub manageProcesses: bool,
+    // O6 lifecycle simulation: when true, the replica set is VIRTUAL -- one int per replica in simReplicas
+    // (-2 = running, else the exit code of a pending crash). spawn/kill/poll/ensureReplicas/running all
+    // operate on it deterministically, so crash loops, restart policy, and rescale-at-scale are exercised
+    // in-process without spawning binaries (no timing races, unlike real processes). Injected via simCrash.
+    pub simulated: bool,
+    pub simReplicas: list.List<int>,
+    reportedIsolation: bool,   // logged the "isolation not applied" report once for this workload
+    init(sp: spec.Spec) {
+        self.spec = sp;
+        self.procs = list.List<process.Process>();
+        self.ports = list.List<int>();
+        self.netnsSlots = list.List<int>();
+        self.restarts = 0;
+        self.manageProcesses = true;
+        self.simulated = false;
+        self.simReplicas = list.List<int>();
+        self.reportedIsolation = false;
+    }
+
+    // Acceptance bar item 6 (isolation is honest): if a workload asks for cgroup limits or a container/netns
+    // isolation level but this platform cannot apply them (no cgroups v2, i.e. not Linux), REPORT it once
+    // instead of silently running unconstrained while the manifest claims a limit. On Linux the limits are
+    // actually applied (isolation.applyLimits), so nothing is reported.
+    fn reportIsolationOnce(self: Supervisor): void {
+        if (self.reportedIsolation) { return; }
+        if (isolation.requestsIsolation(self.spec)) {
+            if (!isolation.available()) {
+                console.log(`kynatord: workload '${self.spec.name}' requests resource limits or isolation, but this platform has no cgroups v2 (not Linux). Limits are NOT applied; the replicas run UNCONSTRAINED. This is reported, never silently claimed.`);
+            } else if (!isolation.writable()) {
+                // cgroups v2 IS present, but we cannot create/delegate the kyte subtree (unprivileged: not
+                // root and no delegated /sys/fs/cgroup/kyte). The limit writes would be rejected, so say so
+                // instead of running unconstrained under a manifest that claims a cap.
+                console.log(`kynatord: workload '${self.spec.name}' requests resource limits or isolation and this host HAS cgroups v2, but kynatord lacks permission to write the cgroup tree (run as root, or delegate /sys/fs/cgroup/kyte). Limits are NOT applied; the replicas run UNCONSTRAINED. This is reported, never silently claimed.`);
+            }
+        }
+        self.reportedIsolation = true;
+    }
+
+    fn portInUse(self: Supervisor, p: int): bool {
+        let i = 0;
+        while (i < self.ports.size()) {
+            if ((self.ports.get(i) ?? -1) == p) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Lowest port at/above basePort not currently assigned to a live replica (so a replica restarted after
+    // a middle death reclaims the freed port instead of colliding with a survivor). -1 when not exposed.
+    fn nextFreePort(self: Supervisor): int {
+        // A directly-exposed workload (basePort > 0) gets a distinct port per replica. The port is passed
+        // via KYTE_PORT env (the web framework's convention) always, and additionally via `portFlag` argv
+        // when the app takes a flag; so port assignment must NOT require a portFlag (a plain
+        // `app.run(KYTE_PORT)` workload has none).
+        if (self.spec.basePort <= 0) { return -1; }
+        let p = self.spec.basePort;
+        while (self.portInUse(p)) { p = p + 1; }
+        return p;
+    }
+
+    fn slotInUse(self: Supervisor, s: int): bool {
+        let i = 0;
+        while (i < self.netnsSlots.size()) {
+            if ((self.netnsSlots.get(i) ?? -1) == s) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    // Lowest netns /30 slot at/above netnsBase not held by a live replica (reclaims a freed slot after a
+    // middle death, like nextFreePort). Each replica gets its own namespace + /30.
+    fn nextFreeNetnsSlot(self: Supervisor): int {
+        let s = self.spec.netnsBase;
+        while (self.slotInUse(s)) { s = s + 1; }
+        return s;
+    }
+
+    fn spawnOne(self: Supervisor): void {
+        if (self.simulated) {
+            self.simReplicas.push(-2);                 // a fresh running virtual replica
+            self.ports.push(self.nextFreePort());
+            return;
+        }
+        if (!self.manageProcesses) { return; }
+
+        // Foreign binaries: own the exec bit. A Go/Rust/C#-AOT binary copied onto the node (or fetched as
+        // a content-addressed blob) may lack +x; chmod it 0o755 before exec so it does not fail with
+        // EACCES. Idempotent, foreign-only (a Kyte app build is already executable), best-effort.
+        if (spec.isForeign(self.spec)) { let _ = file.File.chmod(self.spec.binaryPath, 493); }
+
+        // fd-passing handoff (the default): spawn the replica with KYTE_HANDOFF_SOCK set to the workload's
+        // rendezvous, so app.run connects to the service and receives client sockets there instead of
+        // binding a TCP port. The env var is set immediately before the (synchronous) spawn - the child
+        // captures it at exec - then cleared so a later non-handoff spawn does not inherit it.
+        if (self.spec.handoff) {
+            let hargs = list.List<string>();
+            let k = 0;
+            while (k < self.spec.args.size()) { hargs.push(self.spec.args.get(k) ?? ""); k = k + 1; }
+            env.set("KYTE_HANDOFF_SOCK", self.spec.handoffSock);
+            // basePort>0 marks the SERVICE (gateway) process: it needs its public front port too. An APP
+            // replica has basePort 0 (no port - it only receives handed-off sockets).
+            if (self.spec.basePort > 0) { env.set("KYTE_PORT", `${self.spec.basePort}`); }
+            let hp = process.Process.spawn(self.spec.binaryPath, hargs);
+            env.set("KYTE_HANDOFF_SOCK", "");
+            if (self.spec.basePort > 0) { env.set("KYTE_PORT", ""); }
+            let _ = isolation.applyLimits(self.spec, hp.pid());
+            self.procs.push(hp);
+            self.ports.push(self.spec.basePort);   // the service's front port (-1/0 for an app)
+            return;
+        }
+
+        // netns isolation (Linux gateway-only): each replica runs in its own network namespace behind a
+        // veth pair and binds the SAME basePort on its private address, so replicas need no distinct host
+        // port. Launch the binary INSIDE the namespace via `ip netns exec` (netns.wrapExec). On non-Linux
+        // netns.setup is a no-op and this path should not be selected (toSpec only sets netns on Linux).
+        if (self.spec.netns) {
+            let slot = self.nextFreeNetnsSlot();
+            let plan = netns.plan(self.spec.name, slot);
+            let _ = netns.teardown(plan);              // clear any stale namespace from a prior run
+            let _ = netns.setup(plan);
+            let nargs = list.List<string>();
+            let j = 0;
+            while (j < self.spec.args.size()) { nargs.push(self.spec.args.get(j) ?? ""); j = j + 1; }
+            if (self.spec.basePort > 0 && !string.eql(self.spec.portFlag, "")) {
+                nargs.push(self.spec.portFlag);
+                nargs.push(`${self.spec.basePort}`);
+            }
+            let cmdArgs = netns.wrapExec(plan, self.spec.binaryPath, nargs);
+            let np = process.Process.spawn("ip", cmdArgs);
+            let _ = isolation.applyLimits(self.spec, np.pid());
+            self.procs.push(np);
+            self.ports.push(self.spec.basePort);       // every replica shares basePort (disjoint netns)
+            self.netnsSlots.push(slot);
+            return;
+        }
+
+        let port = self.nextFreePort();
+        // Build argv: the spec args, plus the assigned port via `portFlag` ONLY when the app takes a flag.
+        // The port is ALSO passed via env (see below), so a Kyte `app.run(KYTE_PORT)` replica or a foreign
+        // binary reading its own $PORT gets its distinct port with no portFlag set.
+        let args = self.spec.args;
+        if (port >= 0 && !string.eql(self.spec.portFlag, "")) {
+            args = list.List<string>();
+            let i = 0;
+            while (i < self.spec.args.size()) { args.push(self.spec.args.get(i) ?? ""); i = i + 1; }
+            args.push(self.spec.portFlag);
+            args.push(`${port}`);
+        }
+        // Per-replica environment: the spec's own `env` entries, plus the assigned port delivered through
+        // `portEnv` (default KYTE_PORT; a foreign binary that reads $PORT sets portEnv="PORT"; empty
+        // disables env port delivery so the binary relies on portFlag). Built as a "KEY=VALUE" list.
+        let envList = list.List<string>();
+        let ev = 0;
+        while (ev < self.spec.env.size()) { envList.push(self.spec.env.get(ev) ?? ""); ev = ev + 1; }
+        if (port >= 0 && !string.eql(self.spec.portEnv, "")) {
+            envList.push(self.spec.portEnv + "=" + `${port}`);
+        }
+        // File-mounted secrets: resolve each "ENVVAR=/abs/path" handle to "ENVVAR=<file content>" and append
+        // to the SAME env list (so it flows through the identical spawn path). The value is read here, at
+        // spawn, straight from the node file -- it never touched the manifest, the store, or /metrics.
+        let secEnv = secrets.resolveSecretEnv(self.spec.secretRefs);
+        let sx = 0;
+        while (sx < secEnv.size()) { envList.push(secEnv.get(sx) ?? ""); sx = sx + 1; }
+        // I4: isolationLevel>0 clone()s the child into namespaces + rootfs + dropped caps (+ seccomp at
+        // level 3); level 0 is a plain spawn. Linux-only - degrades to a plain spawn elsewhere.
+        // The plain path uses spawnEx, which applies env + workdir per-child (race-free). sandbox.spawn
+        // takes no env/cwd, so for the isolated path we apply env via the process-global set-before-spawn
+        // pattern (safe in the single-reactor control plane) and clear it after; workdir is not applied
+        // under isolation because the child's root is governed by `rootfs`.
+        let isolated = self.spec.isolationLevel > 0;
+        if (isolated) {
+            let z = 0;
+            while (z < envList.size()) {
+                let kv = envList.get(z) ?? "";
+                let eq = string.indexOf(kv, "=");
+                if (eq >= 1) { env.set(string.substring(kv, 0, eq), string.substring(kv, eq + 1, string.len(kv))); }
+                z = z + 1;
+            }
+        }
+        let p = if (self.spec.isolationLevel <= 0)
+                    process.Process.spawnEx(self.spec.binaryPath, args, envList, self.spec.workdir)
+                else if (self.spec.isolationLevel >= 3)
+                    sandbox.spawn(self.spec.binaryPath, args, sandbox.level3(self.spec.rootfs, self.spec.name))
+                else
+                    sandbox.spawn(self.spec.binaryPath, args, sandbox.level1(self.spec.rootfs, self.spec.name));
+        if (isolated) {
+            let z2 = 0;
+            while (z2 < envList.size()) {
+                let kv2 = envList.get(z2) ?? "";
+                let eq2 = string.indexOf(kv2, "=");
+                if (eq2 >= 1) { env.set(string.substring(kv2, 0, eq2), ""); }
+                z2 = z2 + 1;
+            }
+        }
+        // Apply cgroups-v2 limits (Linux; best-effort no-op elsewhere) to the freshly-spawned child.
+        let _ = isolation.applyLimits(self.spec, p.pid());
+        self.procs.push(p);
+        self.ports.push(port);
+    }
+
+    // T1-3 graceful drain: SIGTERM the replica, give it a REAL timed grace window to finish in-flight
+    // requests and exit, then SIGKILL only if it overruns, then reap. The old loop polled tryWait 50 times
+    // with no delay, so SIGKILL followed SIGTERM within microseconds (effectively no grace). This polls
+    // against a WALL-CLOCK deadline instead: it returns the instant the process exits (typically fast once
+    // the app has drained), so the full window is spent only on an app that ignores SIGTERM. There is no
+    // sync sleep primitive in a sync method, so this is a bounded busy-poll; a stop is rare (scale-down or
+    // rolling deploy) and the window is short, so the cost is acceptable for a single-kynatord control plane.
+    fn stopProc(self: Supervisor, p: process.Process): void {
+        let _ = p.terminate();                                  // SIGTERM: drain and exit cleanly
+        let startNs = datetime.nowNs();
+        let graceNs: long = TERMINATION_GRACE_MS * 1000000;     // ms -> ns
+        while (true) {
+            if (p.tryWait() != -2) { break; }                   // exited within the grace window
+            if (datetime.nowNs() - startNs >= graceNs) { break; }
+        }
+        if (p.tryWait() == -2) { let _ = p.forceKill(); }       // overran the grace -> SIGKILL
+        let _ = p.wait();                                       // reap (returns immediately once dead)
+        p.close();
+    }
+
+    fn killLast(self: Supervisor): void {
+        if (self.simulated) {
+            let m = self.simReplicas.size();
+            if (m == 0) { return; }
+            self.simReplicas.remove(m - 1);
+            if (m - 1 < self.ports.size()) { self.ports.remove(m - 1); }
+            return;
+        }
+        let n = self.procs.size();
+        if (n == 0) { return; }
+        let idx = n - 1;
+        if (self.manageProcesses) {
+            let p = self.procs.get(idx) ?? process.Process.spawn("/bin/true", list.List<string>());
+            self.stopProc(p);
+        }
+        self.procs.remove(idx);
+        if (idx < self.ports.size()) { self.ports.remove(idx); }
+        // Tear down this replica's network namespace + veth (netns mode; no-op off Linux).
+        if (self.spec.netns && idx < self.netnsSlots.size()) {
+            let slot = self.netnsSlots.get(idx) ?? -1;
+            if (slot >= 0 && self.manageProcesses) { let _ = netns.teardown(netns.plan(self.spec.name, slot)); }
+            self.netnsSlots.remove(idx);
+        }
+    }
+
+    // Bring the running replica count to spec.replicas (spawn up, stop down). Called on start and on any
+    // scale change.
+    pub fn ensureReplicas(self: Supervisor): void {
+        if (!self.manageProcesses && !self.simulated) { return; }
+        while (self.running() < self.spec.replicas) { self.spawnOne(); }
+        while (self.running() > self.spec.replicas) { self.killLast(); }
+    }
+
+    // T1-1: adopt a new spec WITHOUT restarting anything. Subsequent spawns (and rollOne replacements) use
+    // it; the already-running replicas keep serving until they are individually rolled.
+    pub fn setSpec(self: Supervisor, sp: spec.Spec): void { self.spec = sp; }
+
+    // T1-1 rolling replace: retire the OLDEST replica gracefully (freeing its port) and spawn a fresh one
+    // (current spec) to take its place. One replica is down for the brief stop->start->ready window; the
+    // OTHER replicas keep serving and the data-plane proxy retries any request that hits the port mid-swap,
+    // so a rolling deploy drops zero requests. The freed port is reclaimed by nextFreePort, so the new
+    // replica takes the same port (the discovery set is unchanged).
+    pub fn rollOne(self: Supervisor): void {
+        if (self.simulated) {
+            if (self.simReplicas.size() > 0) { self.simReplicas.remove(0); if (self.ports.size() > 0) { self.ports.remove(0); } }
+            self.spawnOne();
+            return;
+        }
+        if (!self.manageProcesses) { return; }
+        if (self.procs.size() == 0) { self.spawnOne(); return; }
+        if (self.manageProcesses) {
+            let p = self.procs.get(0) ?? process.Process.spawn("/bin/true", list.List<string>());
+            self.stopProc(p);
+        }
+        self.procs.remove(0);
+        if (self.ports.size() > 0) { self.ports.remove(0); }
+        if (self.spec.netns && self.netnsSlots.size() > 0) {
+            let slot = self.netnsSlots.get(0) ?? -1;
+            if (slot >= 0 && self.manageProcesses) { let _ = netns.teardown(netns.plan(self.spec.name, slot)); }
+            self.netnsSlots.remove(0);
+        }
+        self.spawnOne();
+    }
+
+    pub fn start(self: Supervisor): void { self.reportIsolationOnce(); self.ensureReplicas(); }
+
+    // Reap any exited replicas and restart them per policy. Non-blocking (tryWait). A replica that exits
+    // under an "always"/"on-failure" policy is replaced (counting a restart); under "never" it stays
+    // gone. After reaping, top back up to spec.replicas for restart policies (a crash under "always"
+    // must return to N even if several died at once).
+    pub fn poll(self: Supervisor): void {
+        if (self.simulated) {
+            // Reap crashed virtual replicas (code != -2) and restart per policy, mirroring the real path.
+            let k = 0;
+            while (k < self.simReplicas.size()) {
+                let code = self.simReplicas.get(k) ?? -2;
+                if (code == -2) {
+                    k = k + 1;                               // still running
+                } else {
+                    self.simReplicas.remove(k);
+                    if (k < self.ports.size()) { self.ports.remove(k); }
+                    if (spec.shouldRestart(self.spec.restartPolicy, code)) {
+                        self.spawnOne();                     // respawn (appended at the end)
+                        self.restarts = self.restarts + 1;
+                    }
+                    // k unchanged: re-examine the element that shifted into this slot
+                }
+            }
+            return;
+        }
+        if (!self.manageProcesses) { return; }
+        let i = 0;
+        while (i < self.procs.size()) {
+            let p = self.procs.get(i) ?? process.Process.spawn("/bin/true", list.List<string>());
+            let st = p.tryWait();
+            if (st == -2) {
+                i = i + 1;                       // still running
+            } else {
+                // exited (st = code) or errored (-1) → reap + drop this slot (and free its port)
+                p.close();
+                self.procs.remove(i);
+                if (i < self.ports.size()) { self.ports.remove(i); }
+                if (spec.shouldRestart(self.spec.restartPolicy, st)) {
+                    self.spawnOne();             // replace (pushed at the end; don't advance i)
+                    self.restarts = self.restarts + 1;
+                }
+                // i unchanged: re-examine the element that shifted into this slot
+            }
+        }
+    }
+
+    // Stop ALL replicas (graceful). Leaves procs empty.
+    pub fn stopAll(self: Supervisor): void {
+        if (self.simulated) {
+            while (self.simReplicas.size() > 0) { self.simReplicas.remove(self.simReplicas.size() - 1); }
+        } else if (self.manageProcesses) {
+            while (self.procs.size() > 0) { self.killLast(); }
+        } else {
+            while (self.procs.size() > 0) { self.procs.remove(self.procs.size() - 1); }
+        }
+        while (self.ports.size() > 0) { self.ports.remove(self.ports.size() - 1); }
+    }
+
+    pub fn running(self: Supervisor): int {
+        if (self.simulated) {
+            // Count only HEALTHY virtual replicas (-2); a crashed-but-not-yet-reaped slot is not running,
+            // so a crash shows as under-provisioned until the next poll() reaps + restarts it.
+            let n = 0;
+            let i = 0;
+            while (i < self.simReplicas.size()) {
+                if ((self.simReplicas.get(i) ?? 0) == -2) { n = n + 1; }
+                i = i + 1;
+            }
+            return n;
+        }
+        return self.procs.size();
+    }
+
+    // Simulation-only: crash the last `count` running virtual replicas with exit `code`, so the next poll()
+    // reaps them and (per restart policy) restarts them -- driving the restart counter deterministically.
+    // A no-op unless simulated. Use code 0 for a clean exit, nonzero for a failure.
+    pub fn simCrash(self: Supervisor, count: int, code: int): void {
+        if (!self.simulated) { return; }
+        let remaining = count;
+        let i = self.simReplicas.size() - 1;
+        while (i >= 0 && remaining > 0) {
+            if ((self.simReplicas.get(i) ?? -2) == -2) {
+                self.simReplicas.set(i, code);
+                remaining = remaining - 1;
+            }
+            i = i - 1;
+        }
+    }
+
+    // The service endpoints this workload ADVERTISES on `host` -- the desired topology (pure; see
+    // spec.serviceEndpoints). kynatord publishes these to the discovery file; service health-checks liveness.
+    pub fn advertisedEndpoints(self: Supervisor, host: string): list.List<string> {
+        // Handoff mode: nothing to advertise - the service reaches the apps over the AF_UNIX rendezvous
+        // (they register by connecting to it), not via host:port discovery.
+        if (self.spec.handoff) { return list.List<string>(); }
+        // netns mode: each replica is reachable at its PRIVATE veth address (10.66.<slot>.2) on basePort,
+        // regardless of `host` - the gateway is on the same node and forwards to those addresses.
+        if (self.spec.netns) {
+            let out = list.List<string>();
+            let i = 0;
+            while (i < self.netnsSlots.size()) {
+                let slot = self.netnsSlots.get(i) ?? -1;
+                if (slot >= 0) {
+                    let plan = netns.plan(self.spec.name, slot);
+                    out.push(`${plan.appIp}:${self.spec.basePort}`);
+                }
+                i = i + 1;
+            }
+            return out;
+        }
+        return spec.serviceEndpoints(self.spec, host);
+    }
+}

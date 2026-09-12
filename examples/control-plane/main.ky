@@ -1,0 +1,74 @@
+// Kyte control plane - a Datastar dashboard over the orchestrator's app registry.
+//
+// Dogfoods the whole stack: web.app (mediator) + the raw-response escape hatch (handlers return HTML /
+// SSE Responses) + the manifest schema + orch.controlplane + the kyte-datastar package. The page is a
+// static-ish shell that Datastar keeps live by fetching /api/apps on an interval; that endpoint returns
+// Datastar SSE frames (built via a BufferSink) that patch the apps table in place.
+import web.app;
+import web.mediator;
+import web.routing;
+import web.response;
+import orch.controlplane;
+import datastar;
+import ds_sink;
+
+// A DI-registered singleton wrapping the app Registry (keeps orch.controlplane free of any web coupling).
+pub struct RegistryService impl Service {
+    pub reg: controlplane.Registry,
+    init() {
+        self.reg = controlplane.Registry();
+        // Seed a couple of deployed apps so the dashboard has something to show.
+        let _1 = self.reg.deploy("metadata:\n  name: shop\nworkload:\n  binary: ./bin/webapp\n" +
+            "replicas:\n  min: 2\n  max: 6\nautoscale:\n  enabled: true\n  metric: inflight\n  target: 8\n" +
+            "lb:\n  strategy: roundrobin\nnetwork:\n  expose: gateway-only\nroutes:\n  - /api/products\n");
+        let _2 = self.reg.deploy("metadata:\n  name: api\nworkload:\n  binary: ./bin/api\n" +
+            "replicas:\n  min: 1\n  max: 3\nlb:\n  strategy: leastconn\nnetwork:\n  expose: public\n  portBase: 9000\n");
+    }
+}
+
+@serializable pub struct Dashboard impl Message { }
+@serializable pub struct AppsView impl Message { }
+
+// GET / - the dashboard shell. Datastar (loaded from the CDN) fetches /api/apps on load and every 2s;
+// the #apps table is patched in place by the SSE frames that endpoint returns.
+pub struct DashboardHandler impl RequestHandler<Dashboard, Response> {
+    init() {}
+    async fn handle(self: DashboardHandler, q: Dashboard): Response {
+        let page = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Kyte control plane</title>"
+            + "<script type=\"module\" src=\"https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js\"></script>"
+            + "<style>body{font-family:system-ui,sans-serif;margin:2rem}table{border-collapse:collapse}"
+            + "th,td{border:1px solid #ccc;padding:.4rem .8rem;text-align:left}th{background:#f4f4f4}</style></head>"
+            + "<body data-on-load=\"@get('/api/apps')\" data-on-interval__duration.2s=\"@get('/api/apps')\">"
+            + "<h1>Kyte control plane</h1><div id=\"apps\">loading…</div></body></html>";
+        return mediator.html(page);
+    }
+}
+
+// GET /api/apps - Datastar SSE frames that patch #apps with the current registry table.
+pub struct AppsViewHandler impl RequestHandler<AppsView, Response> {
+    rs: RegistryService,
+    init(rs: RegistryService) { self.rs = rs; }
+    async fn handle(self: AppsViewHandler, q: AppsView): Response {
+        // Build a Datastar patch-elements SSE frame via the kyte-datastar package (imported cross-
+        // package). The #apps fragment replaces the table in place; the Datastar client (from the CDN)
+        // applies it. Datastar refetches on the interval declared in the shell (no long-lived stream).
+        let buf = ds_sink.BufferSink();
+        let gen = datastar.Sse.overBuffer(buf);
+        let _ = await gen.patchElementsSimple(controlplane.appsFragment(self.rs.reg));
+        return mediator.sse(buf.contents());
+    }
+}
+
+fn configureServices(): ServiceCollection {
+    let services = ServiceCollection();
+    services.addSingleton("RegistryService", (sp) => { return RegistryService(); });
+    return services;
+}
+
+fn main(): void {
+    let app = App();
+    app.useServices(configureServices());
+    app.get<Dashboard>("/");
+    app.get<AppsView>("/api/apps");
+    app.run(8130);
+}

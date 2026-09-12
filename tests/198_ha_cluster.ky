@@ -1,0 +1,177 @@
+// 198 -- O2 HA at scale: a deterministic N-node leader-lease cluster over one shared in-memory ConfigStore
+// with a MOCK CLOCK and partition/kill injection. Proves RPO=0 (never more than one VALID leader = no
+// split-brain), MEASURES RTO (ms from leader loss to a new valid leader), and soaks random partition/heal
+// while holding the invariant. In-process + deterministic (no sockets, no timing races), so it is a CI gate
+// rather than the flaky multi-process run O2 called out. The lease policy is identical to the live btree
+// path (AsyncLeaderLease); only the store + clock are substituted.
+import assert;
+import store.config;
+import orch.lease;
+import list;
+import string;
+
+const KEY: string = "leases/leader";
+const TTL: long = 1000;
+
+fn defNode(): lease.LeaderLease { return lease.LeaderLease(config.ConfigStore(), "", KEY, TTL); }
+
+fn makeCluster(store: config.ConfigStore, n: int): list.List<lease.LeaderLease> {
+    let nodes = list.List<lease.LeaderLease>();
+    let i = 1;
+    while (i <= n) {
+        nodes.push(lease.LeaderLease(store, `node${i}`, KEY, TTL));
+        i = i + 1;
+    }
+    return nodes;
+}
+
+// One lease tick for node i (renew if leader, else try to acquire) -- unless it is partitioned (can't reach
+// the store, so it does nothing and its lease silently expires).
+fn tickNode(nd: lease.LeaderLease, nowMs: long): void {
+    if (nd.isLeader) { let _ = nd.renew(nowMs); } else { let _ = nd.tryAcquire(nowMs); }
+}
+
+fn tickReachable(nodes: list.List<lease.LeaderLease>, partitioned: list.List<bool>, nowMs: long): void {
+    let i = 0;
+    while (i < nodes.size()) {
+        if (!(partitioned.get(i) ?? false)) { tickNode(nodes.get(i) ?? defNode(), nowMs); }
+        i = i + 1;
+    }
+}
+
+fn nonep(n: int): list.List<bool> {
+    let l = list.List<bool>();
+    let i = 0;
+    while (i < n) { l.push(false); i = i + 1; }
+    return l;
+}
+
+// ---- election ----
+
+@test
+fn test_three_node_election_single_leader(): void {
+    let store = config.ConfigStore();
+    let nodes = makeCluster(store, 3);
+    // All three contend the free lease in the same round: CAS gives exactly one winner.
+    tickReachable(nodes, nonep(3), 0);
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), 0), 1);
+    // Epoch 1, and re-ticking (renew + standby retries) never creates a second leader.
+    tickReachable(nodes, nonep(3), 200);
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), 200), 1);
+}
+
+// ---- failover + RTO measurement ----
+
+@test
+fn test_leader_partition_failover_and_rto(): void {
+    let store = config.ConfigStore();
+    let nodes = makeCluster(store, 3);
+    tickReachable(nodes, nonep(3), 0);
+    let leaderId = lease.electedLeaderId(nodes, defNode(), 0);
+    assert.isFalse(string.eql(leaderId, ""));
+
+    // Partition the elected leader (it stops renewing). Standbys keep ticking on a 200ms cadence.
+    let part = nonep(3);
+    let li = 0;
+    while (li < nodes.size()) {
+        if (string.eql((nodes.get(li) ?? defNode()).nodeId, leaderId)) { part.set(li, true); }
+        li = li + 1;
+    }
+
+    let failAt: long = 0;
+    let t: long = 200;
+    let newLeaderAt: long = -1;
+    while (t <= 4000 && newLeaderAt < 0) {
+        tickReachable(nodes, part, t);
+        // No round may ever show two leaders (RPO=0), even mid-failover.
+        assert.isTrue(lease.validLeaderCount(nodes, defNode(), t) <= 1);
+        let cur = lease.electedLeaderId(nodes, defNode(), t);
+        if (!string.eql(cur, "") && !string.eql(cur, leaderId)) { newLeaderAt = t; }
+        t = t + 200;
+    }
+    assert.isTrue(newLeaderAt > 0);                     // a new leader was elected
+    let rto = newLeaderAt - failAt;
+    // The lease TTL bounds RTO: the standby can only take over once the leader's lease expires.
+    assert.isTrue(rto >= TTL);
+    assert.isTrue(rto <= TTL + 400);                   // within a couple of cadence rounds of the TTL
+    console.log(`[O2] failover RTO: ${rto} ms (ttl ${TTL})`);
+
+    // The healed old leader is FENCED: its epoch was superseded, so renew fails and it is not a leader.
+    let old = defNode();
+    let k = 0;
+    while (k < nodes.size()) {
+        if (string.eql((nodes.get(k) ?? defNode()).nodeId, leaderId)) { old = nodes.get(k) ?? defNode(); }
+        k = k + 1;
+    }
+    tickNode(old, newLeaderAt + 200);
+    assert.isFalse(old.stillLeader(newLeaderAt + 200));
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), newLeaderAt + 200), 1);   // still exactly one
+}
+
+// ---- monotonic epochs across repeated failovers ----
+
+@test
+fn test_epochs_are_monotonic_across_failovers(): void {
+    let store = config.ConfigStore();
+    let nodes = makeCluster(store, 2);
+    let a = nodes.get(0) ?? defNode();
+    let b = nodes.get(1) ?? defNode();
+
+    assert.isTrue(a.tryAcquire(0));                     // A: epoch 1
+    let lastEpoch = a.currentEpoch();
+    assert.isTrue(lastEpoch == 1);
+
+    // Each round the previous leader's lease expires and the OTHER node takes over -> epoch bumps by one,
+    // and never goes backwards. This is the fencing high-water mark climbing across failovers.
+    let t: long = TTL + 1;
+    let round = 0;
+    while (round < 5) {
+        let taker = if ((round % 2) == 0) b else a;     // alternate B, A, B, A, ...
+        assert.isTrue(taker.tryAcquire(t));             // non-holder + expired -> CAS takeover
+        let ep = taker.currentEpoch();
+        assert.isTrue(ep > lastEpoch);                  // strictly climbs on takeover, never backwards
+        lastEpoch = ep;
+        t = t + TTL + 1;
+        round = round + 1;
+    }
+    assert.isTrue(lastEpoch == 6);                      // epoch 1 + 5 takeovers
+}
+
+// ---- 5-node soak: random partition/heal, invariant held every round ----
+
+@test
+fn test_five_node_soak_no_split_brain(): void {
+    let store = config.ConfigStore();
+    let nodes = makeCluster(store, 5);
+    let part = nonep(5);
+    // Deterministic LCG so the chaos is reproducible.
+    let seed: long = 0x5EED01;
+    let t: long = 0;
+    let maxLeaders = 0;
+    let leaderRounds = 0;
+    let round = 0;
+    while (round < 120) {
+        // Flip roughly one node's partition state per round.
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        let idx = (seed / 7) % 5;
+        part.set(idx as int, !(part.get(idx as int) ?? false));
+
+        tickReachable(nodes, part, t);
+        let lc = lease.validLeaderCount(nodes, defNode(), t);
+        assert.isTrue(lc <= 1);                          // THE invariant: never split-brain (RPO=0)
+        if (lc > maxLeaders) { maxLeaders = lc; }
+        if (lc == 1) { leaderRounds = leaderRounds + 1; }
+
+        t = t + 300;                                     // sub-TTL cadence so leaders can persist
+        round = round + 1;
+    }
+    assert.equalInt(maxLeaders, 1);                      // never observed two leaders
+    assert.isTrue(leaderRounds > 0);                     // the cluster did elect leaders
+
+    // Heal everyone and let it settle: a leader must exist.
+    let heal = nonep(5);
+    let s = 0;
+    while (s < 6) { tickReachable(nodes, heal, t); t = t + 300; s = s + 1; }
+    assert.equalInt(lease.validLeaderCount(nodes, defNode(), t), 1);
+    console.log(`[O2] soak: 120 rounds, max concurrent leaders ${maxLeaders}, final epoch ${(nodes.get(0) ?? defNode()).currentEpoch()}`);
+}

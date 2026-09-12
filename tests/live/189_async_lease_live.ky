@@ -1,0 +1,94 @@
+// 189 (LIVE) -- the leader lease + FENCING EPOCH over a REAL artifactd config store, driving TWO
+// orchestrator nodes (HA live path). Each node holds its own HttpConfigStore pointed at the SAME
+// artifactd, and they contend for one lease row via the store's compare-and-set. NOT part of the offline
+// suite (it lives under tests/live/). Run with a fresh artifactd on 127.0.0.1:8135 (see run-live-tests.sh):
+//
+//   ./run-live-tests.sh
+//
+// Proves the HA gate against real persistence: A leads (epoch 1); A partitions; B promotes by taking the
+// expired lease (epoch 2); the unpaused old A is FENCED (its stale-epoch renew is rejected). Safety rests
+// on the epoch (CAS = one winner per epoch), not clocks. The reactor is pumped manually (conformance 205
+// pattern) because the coroutine harness needs a running loop; the clock is mocked (nowMs passed in) so
+// the scenario is deterministic.
+import assert;
+import bytes;
+import net.poller;
+import store.httpconfig;
+import orch.asynclease;
+
+async fn runLive(donePtr: long): void {
+    // Two nodes, two independent clients pointed at the SAME artifactd config store.
+    let sA = httpconfig.HttpConfigStore("http://127.0.0.1:8135", "");
+    let sB = httpconfig.HttpConfigStore("http://127.0.0.1:8135", "");
+    await sA.ensureSchema();   // no-op ping (artifactd self-initialises)
+
+    let a = asynclease.AsyncLeaderLease(sA, "nodeA", "leases/leader", 1000);
+    let b = asynclease.AsyncLeaderLease(sB, "nodeB", "leases/leader", 1000);
+
+    // A acquires the free lease (epoch 1); B sees A's live lease and stays standby.
+    let a1 = await a.tryAcquire(0);
+    assert.isTrue(a1);
+    assert.isTrue(a.myEpoch == 1);
+    let ce1 = await a.currentEpoch();
+    assert.isTrue(ce1 == 1);
+
+    let b1 = await b.tryAcquire(100);
+    assert.isFalse(b1);
+    assert.isFalse(b.isLeader);
+
+    // A renews (deadline -> 1500) and stays leader.
+    let ar = await a.renew(500);
+    assert.isTrue(ar);
+
+    // A partitions: it stops renewing. At now=2000 (> A's deadline) B promotes by taking the expired lease
+    // -> epoch bumps to 2.
+    let b2 = await b.tryAcquire(2000);
+    assert.isTrue(b2);
+    assert.isTrue(b.myEpoch == 2);
+    let ce2 = await b.currentEpoch();
+    assert.isTrue(ce2 == 2);
+
+    // A "unpauses" and tries to carry on with its STALE epoch 1 -> FENCED (rejected against the real store).
+    let ar2 = await a.renew(2100);
+    assert.isFalse(ar2);
+    assert.isFalse(a.isLeader);
+    let asl = await a.stillLeader(2100);
+    assert.isFalse(asl);
+
+    // A cannot reacquire while B's lease is live; B remains the sole leader and keeps renewing.
+    let a3 = await a.tryAcquire(2200);
+    assert.isFalse(a3);
+    let br = await b.renew(2300);
+    assert.isTrue(br);
+
+    connA.close();
+    connB.close();
+    bytes.write_i32(donePtr, 0, 1);
+}
+
+@test
+fn test_async_lease_live_e2e(): void {
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4);
+    bytes.write_i32(done, 0, 0);
+
+    coroStart(runLive(done));
+
+    let guard = 0;
+    while (bytes.read_i32(done, 0) < 1 && guard < 20000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(bytes.read_i32(done, 0) as int, 1);
+    poller.setCurrent(0);
+    bytes.free(done);
+    r.destroy();
+}

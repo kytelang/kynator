@@ -1,0 +1,5 @@
+# Built artifacts (produced by build.sh) — source + manifests are committed, binaries are not.
+*/app
+aspnet/out/
+aspnet/obj/
+aspnet/bin/

@@ -1,0 +1,322 @@
+// 197 -- O6 workload lifecycle AT SCALE, deterministic and in-process via the Supervisor simulation hook
+// (virtual replicas: crash injection + restart-policy reaping, no real binaries, no timing races). Covers
+// crash loops per restart policy, rescale up/down, a 50-workload fleet converging after a crash wave, and
+// the crash-loop -> O5 alert tie-in.
+import assert;
+import orch.spec;
+import orch.supervisor;
+import orch.nativelet;
+import orch.alerts;
+import orch.health;
+import net.autoscale;
+import net.proxy;
+import process;
+import list;
+import string;
+
+fn simSup(name: string, replicas: int, policy: string): supervisor.Supervisor {
+    let sp = spec.Spec(name, "/bin/" + name);
+    sp.replicas = replicas;
+    sp.restartPolicy = policy;
+    let sup = supervisor.Supervisor(sp);
+    sup.simulated = true;
+    sup.start();
+    return sup;
+}
+
+// ---- crash loops per restart policy ----
+
+@test
+fn test_always_policy_converges_and_counts_restarts(): void {
+    let sup = simSup("web", 3, "always");
+    assert.equalInt(sup.running(), 3);
+    assert.equalInt(sup.restarts, 0);
+    // Crash one replica five times; each poll reaps + restarts it back to desired.
+    let k = 0;
+    while (k < 5) {
+        sup.simCrash(1, 1);       // one replica exits with a failure code
+        sup.poll();
+        assert.equalInt(sup.running(), 3);   // always converges back to desired
+        k = k + 1;
+    }
+    assert.equalInt(sup.restarts, 5);
+}
+
+@test
+fn test_never_policy_does_not_restart(): void {
+    let sup = simSup("batch", 2, "never");
+    sup.simCrash(2, 0);           // both exit
+    sup.poll();
+    assert.equalInt(sup.running(), 0);       // never restarted
+    assert.equalInt(sup.restarts, 0);
+}
+
+@test
+fn test_on_failure_policy_distinguishes_exit_code(): void {
+    // Clean exit (0) is NOT restarted; a failure (1) IS.
+    let clean = simSup("cln", 1, "on-failure");
+    clean.simCrash(1, 0);
+    clean.poll();
+    assert.equalInt(clean.running(), 0);
+    assert.equalInt(clean.restarts, 0);
+
+    let fail = simSup("fail", 1, "on-failure");
+    fail.simCrash(1, 1);
+    fail.poll();
+    assert.equalInt(fail.running(), 1);      // restarted
+    assert.equalInt(fail.restarts, 1);
+}
+
+// ---- rescale up and down ----
+
+@test
+fn test_rescale_up_and_down(): void {
+    let sp = spec.Spec("api", "/bin/api");
+    sp.replicas = 2;
+    sp.restartPolicy = "always";
+    let sup = supervisor.Supervisor(sp);
+    sup.simulated = true;
+    sup.start();
+    assert.equalInt(sup.running(), 2);
+
+    sup.spec.replicas = 5;        // scale up
+    sup.ensureReplicas();
+    assert.equalInt(sup.running(), 5);
+
+    sup.spec.replicas = 1;        // scale down
+    sup.ensureReplicas();
+    assert.equalInt(sup.running(), 1);
+}
+
+// ---- a 50-workload fleet converges after a crash wave ----
+
+@test
+fn test_fleet_converges_after_crash_wave(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;
+    n.simulated = true;
+
+    let desired = list.List<spec.Spec>();
+    let i = 1;
+    while (i <= 50) {
+        let s = spec.Spec(`w${i}`, "/bin/w");
+        s.replicas = 2;
+        s.restartPolicy = "always";
+        desired.push(s);
+        i = i + 1;
+    }
+    n.reconcileWith(desired);
+    assert.equalInt(n.status().size(), 50);
+    assert.equalInt(n.totalRunning(), 100);     // 50 workloads x 2 replicas
+    assert.equalInt(n.underProvisioned(), 0);
+
+    // Crash one replica in every workload -> the whole fleet is momentarily under-provisioned.
+    let j = 0;
+    while (j < n.jobs.size()) {
+        (n.jobs.get(j) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).sup.simCrash(1, 1);
+        j = j + 1;
+    }
+    assert.equalInt(n.totalRunning(), 50);      // one down per workload
+    assert.equalInt(n.underProvisioned(), 50);
+
+    // One heal pass restarts them all -> converged.
+    n.pollAll();
+    assert.equalInt(n.totalRunning(), 100);
+    assert.equalInt(n.underProvisioned(), 0);
+}
+
+// ---- scale-down reaps REAL processes without blocking the reactor ----
+
+// The autoscaler must never block reactor 0 on p.wait() during scale-down. It now SIGTERMs the scaled-down
+// backend and PARKS it in pendingReap for a non-blocking tryWait (WNOHANG) reap on a later tick. This drives
+// three REAL child processes (long-lived /bin/sleep so they are provably alive), scales down to one, and
+// asserts every terminated child is reaped through the non-blocking path with no zombie left behind -- and
+// that scaleTo returned promptly rather than blocking until the children exited.
+@test
+fn test_scaledown_reaps_without_blocking_wait(): void {
+    let pool = proxy.Pool();
+    // /bin/sleep <port> stays alive for a long time, so the children are certainly running when we scale down
+    // -- a blocking wait() would hang here; the non-blocking park+reap must not.
+    let a = autoscale.Autoscaler(pool, "/bin/sleep", "127.0.0.1", 30000, 1, 3);
+    a.manageProcesses = true;
+
+    a.scaleTo(3);                              // spawn 3 real sleeps
+    assert.equalInt(a.procs.size(), 3);
+    assert.equalInt(a.current, 3);
+
+    a.scaleTo(1);                              // SIGTERM 2, park them for a non-blocking reap (never wait())
+    assert.equalInt(a.procs.size(), 1);        // scaleTo returned promptly with the survivors
+    assert.equalInt(a.current, 1);
+
+    // Drive the non-blocking reap to convergence: sleep dies on SIGTERM, so tryWait reaps within a few calls.
+    let tries = 0;
+    while (a.reapPending() > 0 && tries < 500000) { tries = tries + 1; }
+    assert.equalInt(a.pendingReap.size(), 0);  // all reaped through tryWait -- no zombies, no blocking wait
+
+    // Clean up the surviving replica directly (scaleTo(0) clamps to minReplicas=1, so it would linger and
+    // keep the test process alive): SIGTERM every remaining child, park, and drain the non-blocking reap.
+    let m = 0;
+    while (m < a.procs.size()) {
+        let p = a.procs.get(m) ?? process.Process.spawn("/bin/true", list.List<string>());
+        let _ = p.terminate();
+        a.pendingReap.push(p);
+        m = m + 1;
+    }
+    let t2 = 0;
+    while (a.reapPending() > 0 && t2 < 500000) { t2 = t2 + 1; }
+    assert.equalInt(a.pendingReap.size(), 0);
+}
+
+// With process management OFF (the deterministic test hook), scale-down is a pure slot flip: nothing is
+// spawned, terminated, or parked for reap.
+@test
+fn test_scaledown_no_processes_parks_nothing(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 31000, 1, 4);
+    a.manageProcesses = false;
+    a.scaleTo(4);
+    assert.equalInt(a.current, 4);
+    a.scaleTo(1);
+    assert.equalInt(a.current, 1);
+    assert.equalInt(a.pendingReap.size(), 0);  // no real processes → nothing parked
+    assert.equalInt(a.procs.size(), 0);
+}
+
+// ---- reconcile drives a REAL process lifecycle (not simulated) ----
+
+// With manageProcesses=true, reconcile actually SPAWNS and STOPS real OS processes: a manifest with replicas=2
+// starts two real children (verified by live PIDs / isRunning), and reconciling the workload away SIGTERM+reaps
+// them. This exercises the real spawn/stop path end-to-end, distinct from the simulated virtual-replica hook.
+@test
+fn test_reconcile_drives_real_process_lifecycle(): void {
+    let n = nativelet.Nativelet("/tmp/unused");
+    n.manageProcesses = true;                 // REAL processes, not the simulated hook
+    n.servicePath = "";                       // no companion-service expansion
+
+    let sp = spec.Spec("sleeper", "/bin/sleep");
+    sp.replicas = 2;
+    sp.restartPolicy = "always";
+    sp.args = list.List<string>();
+    sp.args.push("3600");                     // long-lived so the children are provably alive
+
+    let d = list.List<spec.Spec>();
+    d.push(sp);
+    n.reconcileWith(d);                       // -> newJob -> Supervisor.start -> spawn 2 real /bin/sleep
+
+    assert.equalInt(n.jobs.size(), 1);
+    let job = n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+    assert.equalInt(job.sup.procs.size(), 2);              // two REAL child processes
+    let p0 = job.sup.procs.get(0) ?? process.Process.spawn("/bin/true", list.List<string>());
+    let p1 = job.sup.procs.get(1) ?? process.Process.spawn("/bin/true", list.List<string>());
+    assert.isTrue(p0.pid() > (0 as long));                 // a live OS pid
+    assert.isTrue(p1.pid() > (0 as long));
+    assert.isTrue(p0.isRunning());                         // actually running
+    assert.isTrue(p1.isRunning());
+
+    // Reconcile the workload away -> stopAll SIGTERM+reaps every real child (stopProc waits), job removed.
+    n.reconcileWith(list.List<spec.Spec>());
+    assert.equalInt(n.jobs.size(), 0);
+    assert.isTrue(!p0.isRunning());                        // the real processes are gone
+    assert.isTrue(!p1.isRunning());
+}
+
+// ---- crash loop surfaces as an O5 alert ----
+
+@test
+fn test_crash_loop_fires_o5_alert(): void {
+    let sup = simSup("flappy", 1, "always");
+    let k = 0;
+    while (k < 5) {
+        sup.simCrash(1, 1);
+        sup.poll();
+        k = k + 1;
+    }
+    assert.equalInt(sup.restarts, 5);
+
+    let st = list.List<nativelet.WorkloadStatus>();
+    st.push(nativelet.WorkloadStatus("flappy", 1, sup.running(), sup.restarts));
+    let rep = health.HealthReport("standalone", 0, "", true, 1, 1, 0, 0, 0);
+    let al = alerts.evaluate(rep, st, alerts.AlertThresholds());   // crashLoopRestarts default 5
+    assert.isTrue(alerts.criticalCount(al) >= 1);
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "WorkloadCrashLoop"));
+    assert.isTrue(string.contains(alerts.renderAlertMetrics(al), "workload=\"flappy\""));
+}
+
+// Regression (live crash-recovery): a steady-state reconcile of an UNCHANGED spec must still reap and
+// restart a crashed replica. The bug: specsEqualExceptReplicas matched two IDENTICAL specs, so every
+// unchanged tick took the pure-scale branch (ensureReplicas only) and never reached poll(); a crashed
+// replica whose pid was not yet reaped was counted as running, so it was never restarted (self-heal was
+// silently dead in the live daemon, though direct poll()/pollAll() tests still passed). The heal path
+// bumps `restarts`; the pure-scale path does not -- so restarts>=1 after an unchanged reconcile proves
+// the tick routed through poll(), not ensureReplicas.
+@test
+fn test_reconcile_unchanged_heals_crashed_replica(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;
+    n.simulated = true;
+
+    let d1 = list.List<spec.Spec>();
+    let s1 = spec.Spec("web", "/bin/web");
+    s1.replicas = 2;
+    s1.restartPolicy = "always";
+    d1.push(s1);
+    n.reconcileWith(d1);
+    assert.equalInt(n.totalRunning(), 2);
+    let job0 = n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+    assert.equalInt(job0.sup.restarts, 0);
+
+    // One replica crashes.
+    job0.sup.simCrash(1, 1);
+    assert.equalInt(n.totalRunning(), 1);
+
+    // Re-apply the SAME spec (unchanged). Must route to the heal path (poll -> reap + restart).
+    let d2 = list.List<spec.Spec>();
+    let s2 = spec.Spec("web", "/bin/web");
+    s2.replicas = 2;
+    s2.restartPolicy = "always";
+    d2.push(s2);
+    n.reconcileWith(d2);
+
+    let job0b = n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+    assert.equalInt(n.totalRunning(), 2);        // converged back to desired
+    assert.isTrue(job0b.sup.restarts >= 1);      // proves poll() ran (restart), not just ensureReplicas
+}
+
+// Live autoscaling wiring: an autoscale-enabled workload must have its replica count DRIVEN by the metric
+// through the reconcile loop (nativelet.autoscaleTick -> WorkloadScaler -> ensureReplicas), between
+// [autoMin, autoMax]. Before this was wired the daemon ignored the autoscale block entirely and pinned the
+// count at min. Simulated metric (no cgroup/gateway needed): high load scales up to max, zero load back to
+// min. This is the deterministic proxy for the live cgroup-CPU path exercised on Linux under privilege.
+@test
+fn test_reconcile_drives_autoscaler_up_and_down(): void {
+    let n = nativelet.Nativelet("unused");
+    n.manageProcesses = false;
+    n.simulated = true;
+
+    let d = list.List<spec.Spec>();
+    let s = spec.Spec("api", "/bin/api");
+    s.restartPolicy = "always";
+    s.replicas = 1;
+    s.autoscale = true;
+    s.autoMetric = "cpu";
+    s.autoTarget = 50.0;
+    s.autoMin = 1;
+    s.autoMax = 5;
+    d.push(s);
+    n.reconcileWith(d);
+    assert.equalInt(n.totalRunning(), 1);            // starts pinned at min
+    let job = n.jobs.get(0) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+    assert.isTrue(job.autoOn);
+
+    // Sustained load well above target -> scale up, clamped to max.
+    job.simMetric = 100.0;
+    let up = 0;
+    while (up < 10) { n.autoscaleTick(1.0); up = up + 1; }
+    assert.equalInt(n.totalRunning(), 5);
+
+    // Load falls to zero -> scale back down, clamped to min.
+    job.simMetric = 0.0;
+    let dn = 0;
+    while (dn < 20) { n.autoscaleTick(1.0); dn = dn + 1; }
+    assert.equalInt(n.totalRunning(), 1);
+}

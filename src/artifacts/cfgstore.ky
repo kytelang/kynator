@@ -1,0 +1,252 @@
+// artifacts/cfgstore.ky -- the orchestrator config store, hosted INSIDE artifactd.
+//
+// This replaces the NovaDB-backed SqlConfigStore. The whole point of the move: the control-plane data set
+// is tiny (workload specs, the leader lease, membership, manifests -- a few MB even across thousands of
+// apps), and it never needed a general database. It needed exactly four things -- mutable named keys,
+// an atomic compare-and-set (the leader-lease split-brain guard), prefix listing, and a since-revision
+// watch -- all of which the in-memory `config.ConfigStore` already implements and unit-tests. artifactd
+// is the single service every node already talks to (it holds the deploy blobs + the app/version
+// registry), so hosting the config store here makes the blob-store service the one control-plane
+// coordination point, and removes NovaDB from the stack entirely.
+//
+// Correctness of the leader election rests on the CAS being atomic. Here it is trivially so: artifactd is
+// a single-reactor process that serves one request at a time, and every CAS is a single synchronous call
+// into one in-memory store, so two racing kynatord nodes are serialised by the reactor and exactly one wins
+// an epoch. (That is a simpler, more obviously-correct arbiter than the distributed guarded-UPDATE the
+// SQL path needed.)
+//
+// Durability: after every mutation the whole store is snapshotted to a file (atomic temp+rename). On
+// start we reload it, restoring each key at its ORIGINAL revision and the global revision high-water, so
+// watch(sinceRevision) continuity survives a restart -- the same durability NovaDB gave, for a few MB.
+//
+// HONEST SCOPE: artifactd is the single coordination point, exactly as the shared NovaDB was -- this is
+// parity, not new HA. Multiple kynatord nodes fail over correctly against it via CAS; making the coordinator
+// ITSELF replicated (a standby artifactd) is a separate, larger piece and is intentionally not built here.
+
+import io.file;
+import io.dir;
+import string;
+import list;
+import web.app;
+import web.routing;
+import web.response;
+import web.status;
+import store.config;
+import store.wire;
+
+// A durable wrapper over the in-memory config store: it owns the KV semantics via `inner`, adds a
+// persisted write-fence high-water, and snapshots to disk after every change.
+pub class DurableConfigStore {
+    inner: config.ConfigStore,
+    pub writeEpoch: long,     // fencing high-water; a put stamped below it is rejected (defence in depth)
+    path: string,             // snapshot file; "" disables persistence (tests)
+
+    init(path: string) {
+        self.inner = config.ConfigStore();
+        self.writeEpoch = 0;
+        self.path = path;
+        self.load();
+    }
+
+    // ---- reads (no persist) ----
+    pub fn revision(self: DurableConfigStore): long { return self.inner.revision(); }
+    pub fn get(self: DurableConfigStore, key: string): config.ConfigEntry | undefined { return self.inner.get(key); }
+    pub fn exists(self: DurableConfigStore, key: string): bool { return self.inner.exists(key); }
+    pub fn list(self: DurableConfigStore, prefix: string): list.List<config.ConfigEntry> { return self.inner.list(prefix); }
+    pub fn watch(self: DurableConfigStore, prefix: string, since: long): list.List<config.ConfigEvent> {
+        return self.inner.watch(prefix, since);
+    }
+
+    // ---- writes (persist after) ----
+    pub fn putBy(self: DurableConfigStore, key: string, value: string, by: string, atSecs: long): long {
+        let r = self.inner.putBy(key, value, by, atSecs);
+        self.save();
+        return r;
+    }
+    pub fn casBy(self: DurableConfigStore, key: string, value: string, expectedRevision: long, by: string, atSecs: long): long {
+        let r = self.inner.casBy(key, value, expectedRevision, by, atSecs);
+        if (r >= 0) { self.save(); }        // only persist on a winning CAS
+        return r;
+    }
+    pub fn del(self: DurableConfigStore, key: string): bool {
+        let ok = self.inner.del(key);
+        if (ok) { self.save(); }
+        return ok;
+    }
+    // Raise the fencing high-water (never lowers it). Persisted so the fence survives a restart.
+    pub fn raiseEpoch(self: DurableConfigStore, epoch: long): void {
+        if (epoch > self.writeEpoch) {
+            self.writeEpoch = epoch;
+            self.save();
+        }
+    }
+
+    // ---- persistence ----
+    // Snapshot = field(revision) field(writeEpoch) then one entry-frame per key. Atomic temp+rename so a
+    // crash mid-write never leaves a half-file under the real name. Single-reactor artifactd => a fixed
+    // ".tmp" is safe (one writer).
+    fn save(self: DurableConfigStore): void {
+        if (string.eql(self.path, "")) { return; }
+        let body = wire.field(`${self.inner.revision()}`) + wire.field(`${self.writeEpoch}`)
+            + wire.encodeEntries(self.inner.list(""));
+        let tmp = self.path + ".tmp";
+        if (!File.writeTextOk(tmp, body)) { return; }
+        let _ = Dir.rename(tmp, self.path);
+    }
+
+    fn load(self: DurableConfigStore): void {
+        if (string.eql(self.path, "")) { return; }
+        if (!File.exists(self.path)) { return; }
+        let body = File.readText(self.path);
+        let cur = wire.Cursor(body);
+        let revS = cur.readField();
+        let epS = cur.readField();
+        if (!cur.ok) { return; }                    // empty/corrupt snapshot: start fresh
+        self.writeEpoch = string.parseLong(epS) ?? (0 as long);
+        while (!cur.atEnd() && cur.ok) {
+            let k = cur.readField();
+            let v = cur.readField();
+            let rev = cur.readField();
+            let by = cur.readField();
+            let at = cur.readField();
+            if (!cur.ok) { break; }
+            let e = config.ConfigEntry(k, v, string.parseLong(rev) ?? (0 as long));
+            e.updatedBy = by;
+            e.updatedAt = string.parseLong(at) ?? (0 as long);
+            self.inner.restoreEntry(e);
+        }
+        self.inner.setRevision(string.parseLong(revS) ?? (0 as long));
+    }
+}
+
+// One response builder (keeps the Status reference in one place).
+fn resp(code: int, body: string): Response {
+    return response.Response(Status.fromCode(code), body);
+}
+
+fn hdr(ctx: routing.Context, name: string): string {
+    return ctx.request.getHeader(name) ?? "";
+}
+
+// ---- route handlers -------------------------------------------------------------------------------
+
+pub struct CfgPing impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgPing, ctx: routing.Context): Response { return resp(200, "ok"); }
+}
+
+// The config-store WIRE VERSION token ("kyte-cfg/<N>"), so a client can detect an incompatible framing or
+// route change before it mis-parses a body. Bumped only on a breaking wire change (see STABILITY.md).
+pub struct CfgVersion impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgVersion, ctx: routing.Context): Response { return resp(200, wire.wireVersionString()); }
+}
+
+pub struct CfgRev impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgRev, ctx: routing.Context): Response { return resp(200, `${self.cfg.revision()}`); }
+}
+
+pub struct CfgExists impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgExists, ctx: routing.Context): Response {
+        if (self.cfg.exists(hdr(ctx, "x-cfg-key"))) { return resp(200, ""); }
+        return resp(404, "");
+    }
+}
+
+pub struct CfgGet impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgGet, ctx: routing.Context): Response {
+        let e = self.cfg.get(hdr(ctx, "x-cfg-key"));
+        if (e == undefined) { return resp(404, ""); }
+        return resp(200, wire.encodeEntry(e ?? config.ConfigEntry("", "", 0)));
+    }
+}
+
+pub struct CfgList impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgList, ctx: routing.Context): Response {
+        return resp(200, wire.encodeEntries(self.cfg.list(hdr(ctx, "x-cfg-prefix"))));
+    }
+}
+
+pub struct CfgWatch impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgWatch, ctx: routing.Context): Response {
+        let since = string.parseLong(hdr(ctx, "x-cfg-since")) ?? (0 as long);
+        return resp(200, wire.encodeEvents(self.cfg.watch(hdr(ctx, "x-cfg-prefix"), since)));
+    }
+}
+
+pub struct CfgPut impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgPut, ctx: routing.Context): Response {
+        // Fence: a stamped write below the high-water is a fenced old leader -- reject. An unstamped
+        // write (epoch 0, e.g. an operator/kynatorctl action) is never fenced.
+        let ep = string.parseLong(hdr(ctx, "x-cfg-epoch")) ?? (0 as long);
+        if (ep > 0 && ep < self.cfg.writeEpoch) { return resp(412, "fenced"); }
+        let by = hdr(ctx, "x-cfg-by");
+        let at = string.parseLong(hdr(ctx, "x-cfg-at")) ?? (0 as long);
+        let r = self.cfg.putBy(hdr(ctx, "x-cfg-key"), ctx.request.body, if (string.eql(by, "")) "system" else by, at);
+        return resp(200, `${r}`);
+    }
+}
+
+pub struct CfgCas impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgCas, ctx: routing.Context): Response {
+        let exp = string.parseLong(hdr(ctx, "x-cfg-exp")) ?? (0 as long);
+        let by = hdr(ctx, "x-cfg-by");
+        let at = string.parseLong(hdr(ctx, "x-cfg-at")) ?? (0 as long);
+        // CAS is the leader-lease arbiter and is NOT fenced: it establishes the epoch. The revision
+        // guard inside casBy is the atomic arbiter. -1 (CAS lost) rides back as a 200 body so the client
+        // parses the verdict exactly as SqlConfigStore.cas returned it.
+        let r = self.cfg.casBy(hdr(ctx, "x-cfg-key"), ctx.request.body, exp, if (string.eql(by, "")) "system" else by, at);
+        return resp(200, `${r}`);
+    }
+}
+
+pub struct CfgDel impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgDel, ctx: routing.Context): Response {
+        let ok = self.cfg.del(hdr(ctx, "x-cfg-key"));
+        return resp(200, if (ok) "true" else "false");
+    }
+}
+
+pub struct CfgEpoch impl RouteHandler {
+    cfg: DurableConfigStore,
+    init(cfg: DurableConfigStore) { self.cfg = cfg; }
+    async fn serve(self: CfgEpoch, ctx: routing.Context): Response {
+        self.cfg.raiseEpoch(string.parseLong(ctx.request.body) ?? (0 as long));
+        return resp(200, "ok");
+    }
+}
+
+// Mount the config-store routes onto an already-built App (the DeployAuth middleware applied by
+// buildArtifactService guards these too, since app.use wraps every route regardless of registration
+// order). Call AFTER buildArtifactService.
+pub fn mountConfigStore(app: App, cfg: DurableConfigStore): void {
+    app.get("/cfg/ping", CfgPing(cfg));
+    app.get("/cfg/version", CfgVersion(cfg));
+    app.get("/cfg/rev", CfgRev(cfg));
+    app.get("/cfg/exists", CfgExists(cfg));
+    app.get("/cfg/get", CfgGet(cfg));
+    app.get("/cfg/list", CfgList(cfg));
+    app.get("/cfg/watch", CfgWatch(cfg));
+    app.post("/cfg/put", CfgPut(cfg));
+    app.post("/cfg/cas", CfgCas(cfg));
+    app.post("/cfg/del", CfgDel(cfg));
+    app.post("/cfg/epoch", CfgEpoch(cfg));
+}

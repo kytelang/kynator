@@ -1,0 +1,116 @@
+// 205 -- the artifactd-hosted config store (artifacts/cfgstore.ky) and its wire codec (store/wire.ky),
+// exercised OFFLINE (no server): the same etcd-shaped semantics NovaDB used to back, plus the codec that
+// carries whole records over HTTP and the snapshot that makes it durable across a restart. The live
+// HttpConfigStore <-> artifactd round-trip is proven separately under tests/live/.
+import assert;
+import string;
+import list;
+import io.file;
+import store.config;
+import store.wire;
+import artifacts.cfgstore;
+
+// ---- wire codec: whole records round-trip, binary-safe (values with ':' and newlines) ----
+
+@test
+fn test_wire_entries_roundtrip(): void {
+    let xs = list.List<config.ConfigEntry>();
+    let a = config.ConfigEntry("workloads/web", "name: web\nreplicas: 2", 7 as long);
+    a.updatedBy = "kynatorctl";
+    a.updatedAt = 1725000000 as long;
+    xs.push(a);
+    xs.push(config.ConfigEntry("leases/kynatord", "nodeA|3|1725000123456", 8 as long));
+
+    let decoded = wire.decodeEntries(wire.encodeEntries(xs));
+    assert.equalInt(decoded.size(), 2);
+    let d0 = decoded.get(0) ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(d0.key, "workloads/web");
+    assert.equalStr(d0.value, "name: web\nreplicas: 2");   // colon + newline survive the framing
+    assert.isTrue(d0.revision == (7 as long));
+    assert.equalStr(d0.updatedBy, "kynatorctl");
+    assert.isTrue(d0.updatedAt == (1725000000 as long));
+    let d1 = decoded.get(1) ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(d1.value, "nodeA|3|1725000123456");
+}
+
+@test
+fn test_wire_empty_body(): void {
+    assert.equalInt(wire.decodeEntries("").size(), 0);
+}
+
+// ---- DurableConfigStore: etcd-shaped semantics ----
+
+fn freshStore(): cfgstore.DurableConfigStore {
+    return cfgstore.DurableConfigStore("");   // "" path = no persistence, for the semantic checks
+}
+
+@test
+fn test_put_get_revision(): void {
+    let s = freshStore();
+    let r1 = s.putBy("a", "1", "system", 0);
+    assert.isTrue(r1 == (1 as long));
+    let r2 = s.putBy("b", "2", "system", 0);
+    assert.isTrue(r2 == (2 as long));
+    assert.isTrue(s.revision() == (2 as long));
+    let e = s.get("a") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(e.value, "1");
+    assert.isTrue(s.get("missing") == undefined);
+}
+
+@test
+fn test_cas_create_and_update_and_lost(): void {
+    let s = freshStore();
+    // create-only (expected 0): first wins, a second create loses.
+    let c1 = s.casBy("leases/leader", "nodeA|1|500", 0, "system", 0);
+    assert.isTrue(c1 >= (0 as long));
+    let c2 = s.casBy("leases/leader", "nodeB|1|500", 0, "system", 0);
+    assert.isTrue(c2 == (-1 as long));               // already present: create-only CAS lost
+    // update on the wrong revision loses; on the right revision wins.
+    let cur = s.get("leases/leader") ?? config.ConfigEntry("", "", 0);
+    let bad = s.casBy("leases/leader", "x", cur.revision + (99 as long), "system", 0);
+    assert.isTrue(bad == (-1 as long));
+    let good = s.casBy("leases/leader", "nodeA|2|900", cur.revision, "system", 0);
+    assert.isTrue(good >= (0 as long));
+}
+
+@test
+fn test_del_and_watch_since(): void {
+    let s = freshStore();
+    let _1 = s.putBy("workloads/web", "w", "system", 0);   // rev 1
+    let _2 = s.putBy("workloads/api", "a", "system", 0);   // rev 2
+    // watch since 1 -> only the api write (rev 2) under the prefix.
+    let evs = s.watch("workloads/", 1 as long);
+    assert.equalInt(evs.size(), 1);
+    let ev = evs.get(0) ?? config.ConfigEvent("", "", 0, false);
+    assert.equalStr(ev.key, "workloads/api");
+    // delete bumps the global revision and removes the key.
+    assert.isTrue(s.del("workloads/web"));
+    assert.isTrue(s.get("workloads/web") == undefined);
+    assert.isTrue(s.revision() == (3 as long));
+}
+
+// ---- durability: snapshot survives a "restart" with revisions intact ----
+
+@test
+fn test_snapshot_reload_preserves_revisions(): void {
+    let path = "/tmp/kyte_orch_cfgstore_test.snap";
+    let _rm = File.remove(path);          // start clean
+    let s1 = cfgstore.DurableConfigStore(path);
+    let _1 = s1.putBy("workloads/web", "name: web\nreplicas: 2", "kynatorctl", 111 as long);
+    let _2 = s1.putBy("leases/kynatord", "nodeA|4|900", "system", 0);
+    let _3 = s1.del("workloads/web");     // rev now 3, web gone
+    let _4 = s1.putBy("members/nodeA", "10.0.0.1:9000", "system", 0);  // rev 4
+    s1.raiseEpoch(4 as long);
+
+    // "Restart": a new store on the same path reloads the snapshot.
+    let s2 = cfgstore.DurableConfigStore(path);
+    assert.isTrue(s2.revision() == (4 as long));           // global high-water preserved
+    assert.isTrue(s2.writeEpoch == (4 as long));           // fence high-water preserved
+    assert.isTrue(s2.get("workloads/web") == undefined);   // the delete persisted
+    let lease = s2.get("leases/kynatord") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(lease.value, "nodeA|4|900");
+    assert.isTrue(lease.revision == (2 as long));          // per-key revision preserved (not renumbered)
+    let mem = s2.get("members/nodeA") ?? config.ConfigEntry("", "", 0);
+    assert.equalStr(mem.value, "10.0.0.1:9000");
+    let _cl = File.remove(path);
+}

@@ -1,0 +1,5 @@
+{
+  "manifestsDir": "manifests",
+  "reconcileMs": 2000,
+  "nodeId": "node-1"
+}

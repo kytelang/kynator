@@ -1,0 +1,11 @@
+{
+  "listenHost": "",
+  "listenPort": 8080,
+  "timeoutMs": 15000,
+  "strategy": "roundrobin",
+  "health": { "enabled": true, "path": "/healthz", "intervalMs": 2000, "timeoutMs": 1000, "rise": 2, "fall": 3 },
+  "backends": [
+    { "host": "127.0.0.1", "port": 9001, "weight": 1 },
+    { "host": "127.0.0.1", "port": 9002, "weight": 2 }
+  ]
+}

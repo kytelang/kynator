@@ -1,0 +1,393 @@
+// cfg/config.ky -- typed, validated JSON configuration for the two orchestrator binaries.
+//
+// The stack is split into a DATA plane (service, net.*) and a CONTROL plane (kynatord, orch.*/store.*),
+// each with its own binary and its own config file. This module is the single place that reads and
+// VALIDATES those files, so a bad config fails loudly at startup with a clear message instead of the
+// daemon limping on with silent defaults (the same "no env band-aids" discipline the btree config took).
+//
+// A missing file is allowed (every field has a sensible default); a PRESENT file with a malformed value
+// or an out-of-range field is a hard error surfaced through validate().
+import serde.json;
+import list;
+import string;
+import io.file;
+import env;
+
+// Resolve the config-file path: first positional (non-flag) CLI argument, else `envVar`, else `dflt`.
+// Shared by both daemons so `service [config.json]` / `kynatord [config.json]` and SERVICE_CONFIG /
+// ORCHD_CONFIG behave identically; `--flags` are skipped here (see hasFlag).
+pub fn resolveConfigPath(envVar: string, dflt: string): string {
+    let a = env.args();
+    let i = 1;
+    while (i < a.size()) {
+        let p = a.get(i) ?? "";
+        if (!string.eql(p, "") && !string.startsWith(p, "-")) { return p; }
+        i = i + 1;
+    }
+    let e = env.get(envVar);
+    if (!string.eql(e, "")) { return e; }
+    return dflt;
+}
+
+// Whether a CLI flag (e.g. "--check") was passed. `--check` makes a daemon load + validate its config
+// and exit 0/1 WITHOUT serving -- a config lint for CI and operators.
+pub fn hasFlag(name: string): bool {
+    let a = env.args();
+    let i = 1;
+    while (i < a.size()) {
+        if (string.eql(a.get(i) ?? "", name)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---- present-but-wrong-type detection (loud-fail) ----
+//
+// A missing key legitimately falls back to the field default (dev convenience). But a key that IS
+// present with the wrong JSON type (a string where a number is wanted, and so on) must FAIL LOUDLY at
+// startup, to honour the README promise: "a present file with a bad value fails loudly at startup, never
+// silently defaults." The plain `?? default` extraction below cannot tell "absent" from "present but
+// malformed", so these helpers do: each returns a non-empty reason when `key` is present in `obj` but not
+// decodable as the expected type, else "". loadX() accumulates the first such reason into `loadError`,
+// and validateX() reports it before anything else.
+fn badString(obj: json.JsonValue, key: string, label: string): string {
+    if (json.has(obj, key) && json.asString(json.get(obj, key)) == undefined) {
+        return `${label} must be a string`;
+    }
+    return "";
+}
+fn badNumber(obj: json.JsonValue, key: string, label: string): string {
+    if (json.has(obj, key) && json.asNumber(json.get(obj, key)) == undefined) {
+        return `${label} must be a number`;
+    }
+    return "";
+}
+fn badBool(obj: json.JsonValue, key: string, label: string): string {
+    if (json.has(obj, key) && json.asBool(json.get(obj, key)) == undefined) {
+        return `${label} must be a boolean`;
+    }
+    return "";
+}
+// Keep the FIRST non-empty reason: `acc = firstErr(acc, badX(...))` chains checks left to right.
+fn firstErr(a: string, b: string): string {
+    if (!string.eql(a, "")) { return a; }
+    return b;
+}
+
+// ---- service (data plane) ----
+
+// One static backend in the proxy pool. `weight` drives the Weighted LB strategy (default 1).
+pub struct BackendCfg {
+    pub host: string,
+    pub port: int,
+    pub weight: int,
+    init(host: string, port: int, weight: int) {
+        self.host = host;
+        self.port = port;
+        self.weight = weight;
+    }
+}
+
+pub struct ProxyConfig {
+    pub listenHost: string,          // "" = any interface
+    pub listenPort: int,
+    pub timeoutMs: int,              // per-upstream I/O deadline
+    pub strategy: string,            // roundrobin | weighted | leastconn | consistenthash
+    pub healthChecks: bool,
+    pub healthPath: string,
+    pub healthIntervalMs: int,
+    pub healthTimeoutMs: int,
+    pub healthRise: int,
+    pub healthFall: int,
+    pub backends: list.List<BackendCfg>,
+    // Control-plane interface: when set, service resolves its backend endpoint from a service-discovery file
+    // (written by kynatord's ServiceRegistry) instead of, or in addition to, the static `backends` list.
+    pub discoveryFile: string,
+    pub discoveryService: string,
+    // How often (ms) the data plane re-reads the discovery file and reshapes its backend pool to the live
+    // set kynatord publishes. Only used when discoveryFile is set. Default tracks a 1s reconcile cadence.
+    pub discoveryRefreshMs: int,
+    // Set by loadProxyConfig when a present field has the wrong JSON type; validateProxy fails on it.
+    pub loadError: string,
+    init() {
+        self.listenHost = "";
+        self.listenPort = 8080;
+        self.timeoutMs = 15000;
+        self.strategy = "roundrobin";
+        self.healthChecks = false;
+        self.healthPath = "/healthz";
+        self.healthIntervalMs = 2000;
+        self.healthTimeoutMs = 1000;
+        self.healthRise = 2;
+        self.healthFall = 3;
+        self.backends = list.List<BackendCfg>();
+        self.discoveryFile = "";
+        self.discoveryService = "";
+        self.discoveryRefreshMs = 1000;
+        self.loadError = "";
+    }
+}
+
+// Load service config from `path`. A missing file yields all-defaults (dev convenience); a present file
+// overrides field by field. Call validateProxy() on the result before using it.
+pub fn loadProxyConfig(path: string): ProxyConfig {
+    let c = ProxyConfig();
+    if (!file.File.exists(path)) { return c; }
+    let root = json.parse(file.File.readText(path));
+
+    // Loud-fail on present-but-wrong-type fields (see badString/badNumber/badBool). A truly ABSENT key
+    // still falls back to its default via the `?? default` extraction below.
+    let e = "";
+    e = firstErr(e, badString(root, "listenHost", "listenHost"));
+    e = firstErr(e, badNumber(root, "listenPort", "listenPort"));
+    e = firstErr(e, badNumber(root, "timeoutMs", "timeoutMs"));
+    e = firstErr(e, badString(root, "strategy", "strategy"));
+    e = firstErr(e, badString(root, "discoveryFile", "discoveryFile"));
+    e = firstErr(e, badString(root, "discoveryService", "discoveryService"));
+    e = firstErr(e, badNumber(root, "discoveryRefreshMs", "discoveryRefreshMs"));
+    if (json.has(root, "health")) {
+        let hv = json.get(root, "health");
+        e = firstErr(e, badBool(hv, "enabled", "health.enabled"));
+        e = firstErr(e, badString(hv, "path", "health.path"));
+        e = firstErr(e, badNumber(hv, "intervalMs", "health.intervalMs"));
+        e = firstErr(e, badNumber(hv, "timeoutMs", "health.timeoutMs"));
+        e = firstErr(e, badNumber(hv, "rise", "health.rise"));
+        e = firstErr(e, badNumber(hv, "fall", "health.fall"));
+    }
+    if (json.has(root, "backends")) {
+        let barr = json.get(root, "backends");
+        let bn = json.size(barr);
+        let bi = 0;
+        while (bi < bn) {
+            let be = json.at(barr, bi);
+            e = firstErr(e, badString(be, "host", `backend ${bi} host`));
+            e = firstErr(e, badNumber(be, "port", `backend ${bi} port`));
+            e = firstErr(e, badNumber(be, "weight", `backend ${bi} weight`));
+            bi = bi + 1;
+        }
+    }
+    c.loadError = e;
+
+    c.listenHost = json.asString(json.get(root, "listenHost")) ?? c.listenHost;
+    c.listenPort = (json.asNumber(json.get(root, "listenPort")) ?? (c.listenPort as long)) as int;
+    c.timeoutMs = (json.asNumber(json.get(root, "timeoutMs")) ?? (c.timeoutMs as long)) as int;
+    c.strategy = json.asString(json.get(root, "strategy")) ?? c.strategy;
+    c.discoveryFile = json.asString(json.get(root, "discoveryFile")) ?? c.discoveryFile;
+    c.discoveryService = json.asString(json.get(root, "discoveryService")) ?? c.discoveryService;
+    c.discoveryRefreshMs = (json.asNumber(json.get(root, "discoveryRefreshMs")) ?? (c.discoveryRefreshMs as long)) as int;
+
+    if (json.has(root, "health")) {
+        let h = json.get(root, "health");
+        c.healthChecks = json.asBool(json.get(h, "enabled")) ?? true;
+        c.healthPath = json.asString(json.get(h, "path")) ?? c.healthPath;
+        c.healthIntervalMs = (json.asNumber(json.get(h, "intervalMs")) ?? (c.healthIntervalMs as long)) as int;
+        c.healthTimeoutMs = (json.asNumber(json.get(h, "timeoutMs")) ?? (c.healthTimeoutMs as long)) as int;
+        c.healthRise = (json.asNumber(json.get(h, "rise")) ?? (c.healthRise as long)) as int;
+        c.healthFall = (json.asNumber(json.get(h, "fall")) ?? (c.healthFall as long)) as int;
+    }
+
+    if (json.has(root, "backends")) {
+        let arr = json.get(root, "backends");
+        let n = json.size(arr);
+        let i = 0;
+        while (i < n) {
+            let b = json.at(arr, i);
+            let host = json.asString(json.get(b, "host")) ?? "";
+            let port = (json.asNumber(json.get(b, "port")) ?? 0) as int;
+            let weight = (json.asNumber(json.get(b, "weight")) ?? 1) as int;
+            c.backends.push(BackendCfg(host, port, weight));
+            i = i + 1;
+        }
+    }
+    return c;
+}
+
+// Return "" when valid, else a human-readable reason. Enforces: a listen port; a known LB strategy;
+// a backend source (either static backends or a discovery file); sane health-check bounds.
+pub fn validateProxy(c: ProxyConfig): string {
+    if (!string.eql(c.loadError, "")) { return c.loadError; }
+    if (c.listenPort <= 0 || c.listenPort > 65535) { return `listenPort out of range: ${c.listenPort}`; }
+    if (!knownStrategy(c.strategy)) { return `unknown strategy: ${c.strategy} (want roundrobin|weighted|leastconn|consistenthash)`; }
+    if (c.backends.size() == 0 && string.eql(c.discoveryFile, "")) {
+        return "no backends: set `backends` or `discoveryFile`+`discoveryService`";
+    }
+    if (!string.eql(c.discoveryFile, "") && string.eql(c.discoveryService, "")) {
+        return "discoveryFile set but discoveryService is empty";
+    }
+    let i = 0;
+    while (i < c.backends.size()) {
+        let b = c.backends.get(i) ?? BackendCfg("", 0, 1);
+        if (string.eql(b.host, "") || b.port <= 0 || b.port > 65535) {
+            return `backend ${i} has an invalid host/port`;
+        }
+        if (b.weight <= 0) { return `backend ${i} weight must be >= 1`; }
+        i = i + 1;
+    }
+    if (c.healthChecks && (c.healthIntervalMs <= 0 || c.healthRise <= 0 || c.healthFall <= 0)) {
+        return "health check bounds must be > 0 when health checks are enabled";
+    }
+    return "";
+}
+
+pub fn knownStrategy(s: string): bool {
+    return string.eql(s, "roundrobin") || string.eql(s, "weighted")
+        || string.eql(s, "leastconn") || string.eql(s, "consistenthash");
+}
+
+// ---- kynatord config store (O4): the artifactd-hosted config store over HTTP ----
+
+// How kynatord's HttpConfigStore reaches the config store. The store now lives INSIDE artifactd (the deploy
+// blob origin), reached over its /cfg/* HTTP routes -- NovaDB has been removed from the stack. `addr` is
+// artifactd's host:port, `token` is the same deploy bearer token artifactd guards its routes with, and
+// `tls` selects https for the hop. Empty token => auth disabled (dev only). enabled=false => kynatord runs
+// without a config store (manifest-only, single-node reconcile).
+pub struct StoreConfig {
+    pub enabled: bool,
+    pub addr: string,        // host:port of the artifactd config store
+    pub token: string,       // deploy bearer token (guards artifactd's routes)
+    pub tls: bool,           // use https for the hop
+    init() {
+        self.enabled = false;
+        self.addr = "127.0.0.1:8135";
+        self.token = "";
+        self.tls = false;
+    }
+}
+
+// The base URL of the artifactd-hosted config store: http(s)://<addr>. HttpConfigStore appends the
+// /cfg/* paths. TLS selects the scheme; certificate verification for a verified hop is a follow-on
+// (getVerified) and out of scope for this move.
+pub fn storeBaseUrl(s: StoreConfig): string {
+    let scheme = if (s.tls) "https" else "http";
+    return `${scheme}://${s.addr}`;
+}
+
+// The artifact ORIGIN base URL kynatord pulls blobs from. Prefer an explicit `artifactOrigin` (the
+// bring-your-own object store); otherwise fall back to the config store's own URL (the all-in-one dev
+// artifactd). "" when neither is configured, which disables pulling (a cached or local binary still runs).
+pub fn artifactOriginUrl(c: OrchConfig): string {
+    if (!string.eql(c.artifactOrigin, "")) { return c.artifactOrigin; }
+    if (!string.eql(c.store.addr, "")) { return storeBaseUrl(c.store); }
+    return "";
+}
+
+// The bearer for the artifact origin: an explicit artifactToken, else the store token (all-in-one dev).
+pub fn artifactBearer(c: OrchConfig): string {
+    if (!string.eql(c.artifactToken, "")) { return c.artifactToken; }
+    return c.store.token;
+}
+
+pub fn validateStore(s: StoreConfig): string {
+    if (!s.enabled) { return ""; }
+    if (string.eql(s.addr, "")) { return "store.addr must not be empty when the store is enabled"; }
+    return "";
+}
+
+// ---- kynatord (control plane) ----
+
+pub struct OrchConfig {
+    pub manifestsDir: string,        // dir of *.json workload manifests the nativelet reconciles
+    pub reconcileMs: int,            // reconcile loop period
+    pub nodeId: string,              // this node's identity (leader lease + logging)
+    // Optional service-discovery publication: the endpoints kynatord advertises for service to consume.
+    pub discoveryFile: string,       // "" = do not publish
+    pub advertiseHost: string,       // host service should reach the replicas on (published in the file)
+    pub store: StoreConfig,          // O4: authenticated (+ optional TLS) btree config-store connection
+    // O5 observability: when metricsFile is set, kynatord writes Prometheus exposition text (+ orch_alert
+    // series) there each reconcile tick for a node_exporter textfile collector to scrape; crashLoopRestarts
+    // is the per-workload restart count at/above which a crash-loop alert fires.
+    pub metricsFile: string,
+    pub crashLoopRestarts: int,
+    // Path to the `service` (gateway) binary. When set, kynatord launches + supervises a service process for
+    // each handoff workload (on its rendezvous). "" = do not manage the service (deploy it out-of-band).
+    pub servicePath: string,
+    // Content-addressed artifact delivery. artifactCacheDir is the per-node blob cache a workload's
+    // `artifact: sha256:<hex>` resolves into; when a blob is missing it is pulled by hash from the
+    // artifact origin (the same artifactd that hosts the config store: base = storeBaseUrl(store),
+    // bearer = store.token) and verified before it is spawned. "" disables resolution.
+    pub artifactCacheDir: string,
+    // Artifact ORIGIN (bring-your-own object store). The base URL kynatord pulls blobs from:
+    // `GET <artifactOrigin>/artifacts/<sha>`, bearer = artifactToken (or store.token if unset). "" =
+    // default to the config store's own URL (storeBaseUrl(store)), i.e. the all-in-one dev artifactd.
+    // Set it to any HTTP(S) object store (S3/MinIO/CDN/nginx) to serve blobs from a durable, TLS-capable
+    // backend independent of the control-plane store; an https:// origin gives TLS on the pull for free
+    // (the web client speaks TLS). See docs/BLOB-STORE.md.
+    pub artifactOrigin: string,
+    pub artifactToken: string,       // bearer for the artifact origin; "" = fall back to store.token
+    // Set by loadOrchConfig when a present field has the wrong JSON type; validateOrch fails on it.
+    pub loadError: string,
+    init() {
+        self.manifestsDir = "manifests";
+        self.reconcileMs = 2000;
+        self.nodeId = "node-1";
+        self.discoveryFile = "";
+        self.advertiseHost = "127.0.0.1";
+        self.store = StoreConfig();
+        self.metricsFile = "";
+        self.crashLoopRestarts = 5;
+        self.servicePath = "";
+        self.artifactCacheDir = "./artifact-cache";
+        self.artifactOrigin = "";
+        self.artifactToken = "";
+        self.loadError = "";
+    }
+}
+
+pub fn loadOrchConfig(path: string): OrchConfig {
+    let c = OrchConfig();
+    if (!file.File.exists(path)) { return c; }
+    let root = json.parse(file.File.readText(path));
+
+    // Loud-fail on present-but-wrong-type fields; a truly ABSENT key keeps its default (extraction below).
+    let e = "";
+    e = firstErr(e, badString(root, "manifestsDir", "manifestsDir"));
+    e = firstErr(e, badNumber(root, "reconcileMs", "reconcileMs"));
+    e = firstErr(e, badString(root, "nodeId", "nodeId"));
+    e = firstErr(e, badString(root, "discoveryFile", "discoveryFile"));
+    e = firstErr(e, badString(root, "advertiseHost", "advertiseHost"));
+    e = firstErr(e, badString(root, "metricsFile", "metricsFile"));
+    e = firstErr(e, badNumber(root, "crashLoopRestarts", "crashLoopRestarts"));
+    e = firstErr(e, badString(root, "servicePath", "servicePath"));
+    e = firstErr(e, badString(root, "artifactCacheDir", "artifactCacheDir"));
+    e = firstErr(e, badString(root, "artifactOrigin", "artifactOrigin"));
+    e = firstErr(e, badString(root, "artifactToken", "artifactToken"));
+    if (json.has(root, "store")) {
+        let sv = json.get(root, "store");
+        e = firstErr(e, badBool(sv, "enabled", "store.enabled"));
+        e = firstErr(e, badString(sv, "addr", "store.addr"));
+        e = firstErr(e, badString(sv, "token", "store.token"));
+        e = firstErr(e, badBool(sv, "tls", "store.tls"));
+    }
+    c.loadError = e;
+
+    c.manifestsDir = json.asString(json.get(root, "manifestsDir")) ?? c.manifestsDir;
+    c.reconcileMs = (json.asNumber(json.get(root, "reconcileMs")) ?? (c.reconcileMs as long)) as int;
+    c.nodeId = json.asString(json.get(root, "nodeId")) ?? c.nodeId;
+    c.discoveryFile = json.asString(json.get(root, "discoveryFile")) ?? c.discoveryFile;
+    c.advertiseHost = json.asString(json.get(root, "advertiseHost")) ?? c.advertiseHost;
+    c.metricsFile = json.asString(json.get(root, "metricsFile")) ?? c.metricsFile;
+    c.crashLoopRestarts = (json.asNumber(json.get(root, "crashLoopRestarts")) ?? (c.crashLoopRestarts as long)) as int;
+    c.servicePath = json.asString(json.get(root, "servicePath")) ?? c.servicePath;
+    c.artifactCacheDir = json.asString(json.get(root, "artifactCacheDir")) ?? c.artifactCacheDir;
+    c.artifactOrigin = json.asString(json.get(root, "artifactOrigin")) ?? c.artifactOrigin;
+    c.artifactToken = json.asString(json.get(root, "artifactToken")) ?? c.artifactToken;
+
+    if (json.has(root, "store")) {
+        let st = json.get(root, "store");
+        c.store.enabled = json.asBool(json.get(st, "enabled")) ?? true;
+        c.store.addr = json.asString(json.get(st, "addr")) ?? c.store.addr;
+        c.store.token = json.asString(json.get(st, "token")) ?? c.store.token;
+        c.store.tls = json.asBool(json.get(st, "tls")) ?? c.store.tls;
+    }
+    return c;
+}
+
+pub fn validateOrch(c: OrchConfig): string {
+    if (!string.eql(c.loadError, "")) { return c.loadError; }
+    if (string.eql(c.manifestsDir, "")) { return "manifestsDir must not be empty"; }
+    if (c.reconcileMs <= 0) { return `reconcileMs must be > 0 (got ${c.reconcileMs})`; }
+    if (string.eql(c.nodeId, "")) { return "nodeId must not be empty"; }
+    let se = validateStore(c.store);
+    if (!string.eql(se, "")) { return se; }
+    return "";
+}

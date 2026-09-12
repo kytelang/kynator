@@ -1,0 +1,194 @@
+// orch/lease.ky -- the leader lease with a FENCING EPOCH (P3 of the config-store design).
+//
+// Exactly-one-writer election as an orchestrator policy on top of the config store's compare-and-set
+// (store/config.ky cas): a single lease row holds "holder|epoch|deadlineMs". A node becomes leader by
+// CAS-writing that row -- create-only when the lease is free, or CAS-on-revision takeover when the current
+// holder's deadline has passed -- and every takeover BUMPS the epoch. Because acquire is a CAS, only one
+// node can win a given epoch; a partitioned OLD leader keeps its STALE epoch, so once a new leader has
+// bumped it, the old leader's renew/act is rejected (it is FENCED) independent of the lease TTL or clocks.
+// This is the orchestrator-side mirror of BTreeDB's R2 frame fencing: the epoch, not time, is what makes
+// two committers impossible; leases use time only for LIVENESS (deciding a holder is gone).
+//
+// This layer is over the SYNC in-memory ConfigStore so the fencing property is unit-testable offline with
+// a mock clock (nowMs passed in). The live variant is the same policy over SqlConfigStore (async).
+
+import store.config;
+import orch.nativelet;
+import string;
+import list;
+
+// The decoded lease row.
+pub struct LeaseState {
+    pub holder: string,
+    pub epoch: long,
+    pub deadlineMs: long,
+    init(holder: string, epoch: long, deadlineMs: long) {
+        self.holder = holder;
+        self.epoch = epoch;
+        self.deadlineMs = deadlineMs;
+    }
+}
+
+// Public so the async sibling (AsyncLeaderLease over SqlConfigStore) reuses the exact lease encoding.
+pub fn encodeLease(holder: string, epoch: long, deadlineMs: long): string {
+    return holder + "|" + epoch + "|" + deadlineMs;
+}
+
+pub fn decodeLease(s: string): LeaseState {
+    let parts = string.split(s, "|");
+    if (parts.size() < 3) { return LeaseState("", 0, 0); }
+    return LeaseState(parts.at(0), string.parseI64(parts.at(1)), string.parseI64(parts.at(2)));
+}
+
+// Cluster-wide safety check: how many nodes are the VALID leader right now (the store shows them as holder,
+// at their epoch, unexpired). Under the CAS + fencing invariant this is ALWAYS 0 or 1; a value >= 2 is
+// split-brain and a hard bug. O2 asserts this stays <= 1 across partition/heal chaos; a live deployment can
+// scrape it as the split-brain gauge. `defaultNode` is a throwaway used only for the optional unwrap.
+pub fn validLeaderCount(nodes: list.List<LeaderLease>, defaultNode: LeaderLease, nowMs: long): int {
+    let n = 0;
+    let i = 0;
+    while (i < nodes.size()) {
+        if ((nodes.get(i) ?? defaultNode).stillLeader(nowMs)) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The nodeId of the current valid leader (first one found), or "" if the cluster has no leader right now.
+pub fn electedLeaderId(nodes: list.List<LeaderLease>, defaultNode: LeaderLease, nowMs: long): string {
+    let i = 0;
+    while (i < nodes.size()) {
+        let nd = nodes.get(i) ?? defaultNode;
+        if (nd.stillLeader(nowMs)) { return nd.nodeId; }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub struct LeaderLease {
+    pub store: config.ConfigStore,
+    pub nodeId: string,
+    pub key: string,
+    pub ttlMs: long,
+    pub myEpoch: long,      // the epoch this node currently holds (0 when not leader)
+    pub isLeader: bool,
+
+    init(store: config.ConfigStore, nodeId: string, key: string, ttlMs: long) {
+        self.store = store;
+        self.nodeId = nodeId;
+        self.key = key;
+        self.ttlMs = ttlMs;
+        self.myEpoch = 0;
+        self.isLeader = false;
+    }
+
+    // Try to become leader. Returns true if this node holds the lease after the call.
+    //  - lease FREE (absent): CAS-create at epoch 1.
+    //  - lease EXPIRED (deadline <= now) or already ours: CAS-takeover (guarded by revision) at epoch+1.
+    //  - lease LIVE and held by another node: stay standby (false).
+    // The CAS guard means a race between two candidates has exactly one winner.
+    pub fn tryAcquire(self: LeaderLease, nowMs: long): bool {
+        if (!self.store.exists(self.key)) {
+            let val = encodeLease(self.nodeId, 1, nowMs + self.ttlMs);
+            let r = self.store.cas(self.key, val, 0);         // create-only
+            if (r >= 0) {
+                self.myEpoch = 1;
+                self.isLeader = true;
+                return true;
+            }
+            return false;                                     // lost the create race
+        }
+        let cur = self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = decodeLease(cur.value);
+        let mine = string.eql(st.holder, self.nodeId);
+        if (nowMs < st.deadlineMs && !mine) {
+            self.isLeader = false;                            // someone else holds a LIVE lease
+            return false;
+        }
+        // Expired, or renewing our own: take it with a bumped epoch, guarded by the current revision.
+        let newEpoch = st.epoch + 1;
+        let val = encodeLease(self.nodeId, newEpoch, nowMs + self.ttlMs);
+        let r = self.store.cas(self.key, val, cur.revision);
+        if (r >= 0) {
+            self.myEpoch = newEpoch;
+            self.isLeader = true;
+            return true;
+        }
+        return false;                                         // lost the takeover race
+    }
+
+    // Extend our lease. Succeeds only if the store still shows US as holder at OUR epoch; if a new leader
+    // has taken over (epoch bumped past ours), we have been FENCED -- step down and return false.
+    pub fn renew(self: LeaderLease, nowMs: long): bool {
+        if (!self.isLeader) { return false; }
+        if (!self.store.exists(self.key)) { self.isLeader = false; return false; }
+        let cur = self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = decodeLease(cur.value);
+        if (!string.eql(st.holder, self.nodeId) || st.epoch != self.myEpoch) {
+            self.isLeader = false;                            // FENCED: a newer epoch owns the lease
+            return false;
+        }
+        let val = encodeLease(self.nodeId, self.myEpoch, nowMs + self.ttlMs);
+        let r = self.store.cas(self.key, val, cur.revision);
+        if (r >= 0) { return true; }
+        self.isLeader = false;                                // lost the guarded write (concurrent takeover)
+        return false;
+    }
+
+    // Whether this node is STILL the valid leader: the store shows us as holder, at our epoch, unexpired.
+    // A fenced/expired node flips isLeader to false. This is the guard the reconcile loop checks before it
+    // acts, so a stale leader stops driving workloads the moment it can observe it lost.
+    pub fn stillLeader(self: LeaderLease, nowMs: long): bool {
+        if (!self.isLeader) { return false; }
+        if (!self.store.exists(self.key)) { self.isLeader = false; return false; }
+        let cur = self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = decodeLease(cur.value);
+        if (!string.eql(st.holder, self.nodeId) || st.epoch != self.myEpoch || nowMs >= st.deadlineMs) {
+            self.isLeader = false;
+            return false;
+        }
+        return true;
+    }
+
+    // Voluntarily give up leadership (DRAIN, for a rolling upgrade): write the lease back as EXPIRED at the
+    // current epoch so a standby's next tryAcquire takes over immediately (bumping the epoch) instead of
+    // waiting out the TTL. Keeps the fencing high-water mark intact. No-op for a non-leader. Returns true if
+    // it drained. After this the node is a standby and stillLeader() is false.
+    pub fn release(self: LeaderLease, nowMs: long): bool {
+        if (!self.isLeader) { return false; }
+        if (!self.store.exists(self.key)) { self.isLeader = false; return false; }
+        let cur = self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        let st = decodeLease(cur.value);
+        if (!string.eql(st.holder, self.nodeId) || st.epoch != self.myEpoch) { self.isLeader = false; return false; }
+        // Expired lease at the same epoch: a standby sees "not mine + expired" and takes over at epoch+1.
+        let val = encodeLease(self.nodeId, self.myEpoch, nowMs);
+        let _ = self.store.cas(self.key, val, cur.revision);
+        self.isLeader = false;
+        return true;
+    }
+
+    // The epoch currently recorded in the store's lease row (0 if the lease is absent). The fencing
+    // high-water mark: any actor whose epoch is below this has been superseded.
+    pub fn currentEpoch(self: LeaderLease): long {
+        if (!self.store.exists(self.key)) { return 0; }
+        let cur = self.store.get(self.key) ?? config.ConfigEntry("", "", 0);
+        return decodeLease(cur.value).epoch;
+    }
+
+    // One HA reconcile tick: refresh (or try to take) leadership, then reconcile the nativelet from
+    // `entries` ONLY if we are the valid leader. A standby -- or a fenced old leader -- does NOT touch
+    // workloads (read-only until promoted), which is the P3 safety promise: exactly one node drives the
+    // fleet at a time. Returns whether this node acted as leader this tick.
+    pub fn haReconcileTick(self: LeaderLease, n: nativelet.Nativelet, entries: list.List<config.ConfigEntry>, prefix: string, nowMs: long): bool {
+        if (self.isLeader) {
+            let _ = self.renew(nowMs);
+        } else {
+            let _ = self.tryAcquire(nowMs);
+        }
+        if (self.stillLeader(nowMs)) {
+            n.reconcileFromEntries(entries, prefix);
+            return true;
+        }
+        return false;                                     // standby / fenced: read-only, do not reconcile
+    }
+}

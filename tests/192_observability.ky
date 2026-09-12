@@ -1,0 +1,64 @@
+// 192 -- P4 observability: the nativelet exposes a per-workload status snapshot (desired vs running
+// replicas + cumulative restarts) plus an under-provisioned gauge, so a caller can scrape a /metrics
+// endpoint or emit a structured log line each reconcile tick. Exercised with manageProcesses=false, so no
+// replicas actually spawn (running() == 0) and the snapshot's SHAPE -- names, desired counts, ordering --
+// is what we assert deterministically. Complements 186/191 (the reconcile behavior itself).
+import assert;
+import string;
+import store.config;
+import orch.nativelet;
+
+fn specJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name + "\",\"replicas\":" + reps + "}";
+}
+
+@test
+fn test_status_snapshot(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+
+    let _1 = store.put("workloads/web", specJson("web", 3));
+    let _2 = store.put("workloads/api", specJson("api", 1));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+
+    let st = n.status();
+    assert.equalInt(st.size(), 2);
+
+    // job order is insertion order: web then api.
+    let web = st.get(0) ?? nativelet.WorkloadStatus("", 0, 0, 0);
+    assert.equalStr(web.name, "web");
+    assert.equalInt(web.desired, 3);
+    assert.equalInt(web.running, 0);          // manageProcesses=false: nothing spawned
+    assert.equalInt(web.restarts, 0);
+
+    let api = st.get(1) ?? nativelet.WorkloadStatus("", 0, 0, 0);
+    assert.equalStr(api.name, "api");
+    assert.equalInt(api.desired, 1);
+
+    // Every workload is under desired (running 0 < desired) with no real processes, so the gauge == count.
+    assert.equalInt(n.underProvisioned(), 2);
+    assert.equalInt(n.totalRunning(), 0);
+}
+
+// The snapshot tracks a scale change: after web 3 -> 5 the desired field follows the last-good spec.
+@test
+fn test_status_follows_scale(): void {
+    let store = config.ConfigStore();
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+
+    let _1 = store.put("workloads/web", specJson("web", 3));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt((n.status().get(0) ?? nativelet.WorkloadStatus("", 0, 0, 0)).desired, 3);
+
+    let _2 = store.put("workloads/web", specJson("web", 5));
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt((n.status().get(0) ?? nativelet.WorkloadStatus("", 0, 0, 0)).desired, 5);
+
+    // Dropping the workload empties the snapshot -> under-provisioned gauge back to 0.
+    let _3 = store.del("workloads/web");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+    assert.equalInt(n.status().size(), 0);
+    assert.equalInt(n.underProvisioned(), 0);
+}

@@ -1,0 +1,106 @@
+// 190 (LIVE) -- P3 ACTUATION half: the elected leader RECONCILES the fleet while the standby stays
+// read-only, over a REAL BTreeDB. Complements 189 (which proves the lease/fencing SAFETY half): here we
+// prove that AsyncLeaderLease.haReconcileTick actually DRIVES workloads on exactly one node at a time.
+// Each node holds its own SqlConfigStore (its own btree connection) over the SAME btree and its own
+// Nativelet (manageProcesses=false so reconcile logic runs without spawning binaries). NOT part of the
+// offline suite (lives under tests/live/). Run with a fresh btree server on 127.0.0.1:3009:
+//
+//   ./run-live-tests.sh
+//
+// Scenario: seed two workloads in the store; A wins the lease and its haReconcileTick converges nodeA's
+// nativelet (2 jobs) while B's tick returns false and nodeB stays EMPTY (read-only standby). A partitions;
+// a spec change lands in the shared store; B promotes (epoch 2) and its tick now converges nodeB toward the
+// NEW desired state; the unpaused old A is FENCED, so its tick returns false and nodeA does NOT pick up the
+// change -- a fenced leader stops driving. The reactor is pumped manually (conformance 205 pattern).
+import assert;
+import bytes;
+import string;
+import net.poller;
+import store.httpconfig;
+import store.config;
+import orch.asynclease;
+import orch.nativelet;
+
+fn specJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name + "\",\"replicas\":" + reps + "}";
+}
+
+async fn runLive(donePtr: long): void {
+    // Two nodes: independent clients + nativelets pointed at the SAME artifactd config store.
+    let sA = httpconfig.HttpConfigStore("http://127.0.0.1:8135", "");
+    let sB = httpconfig.HttpConfigStore("http://127.0.0.1:8135", "");
+    await sA.ensureSchema();
+
+    let nA = nativelet.Nativelet("unused-dir");
+    nA.manageProcesses = false;
+    let nB = nativelet.Nativelet("unused-dir");
+    nB.manageProcesses = false;
+
+    // Desired state: two workloads under workloads/.
+    let _1 = await sA.put("workloads/web", specJson("web", 2));
+    let _2 = await sA.put("workloads/api", specJson("api", 1));
+
+    let a = asynclease.AsyncLeaderLease(sA, "nodeA", "leases/leader", 1000);
+    let b = asynclease.AsyncLeaderLease(sB, "nodeB", "leases/leader", 1000);
+
+    // A ticks first: wins the free lease (epoch 1) and reconciles -> nodeA has both workloads.
+    let aActed1 = await a.haReconcileTick(nA, "workloads/", 0);
+    assert.isTrue(aActed1);
+    assert.isTrue(a.myEpoch == 1);
+    assert.equalInt(nA.jobs.size(), 2);
+    assert.equalInt(nA.desiredReplicas("web"), 2);
+
+    // B ticks: sees A's live lease, stays standby -> READ-ONLY: nodeB drives nothing.
+    let bActed1 = await b.haReconcileTick(nB, "workloads/", 100);
+    assert.isFalse(bActed1);
+    assert.isFalse(b.isLeader);
+    assert.equalInt(nB.jobs.size(), 0);
+
+    // A partitions (stops ticking). A spec change lands in the SHARED store: web scales 2 -> 3.
+    let _3 = await sB.put("workloads/web", specJson("web", 3));
+
+    // B ticks past A's deadline: promotes (epoch 2) and reconciles toward the NEW desired state.
+    let bActed2 = await b.haReconcileTick(nB, "workloads/", 2000);
+    assert.isTrue(bActed2);
+    assert.isTrue(b.myEpoch == 2);
+    assert.equalInt(nB.jobs.size(), 2);
+    assert.equalInt(nB.desiredReplicas("web"), 3);           // B picked up the scale-up
+
+    // A "unpauses" and ticks with its STALE epoch 1 -> FENCED: its tick returns false and it does NOT
+    // reconcile, so nodeA still shows the OLD desired (web=2). A fenced leader stops driving the fleet.
+    let aActed2 = await a.haReconcileTick(nA, "workloads/", 2100);
+    assert.isFalse(aActed2);
+    assert.isFalse(a.isLeader);
+    assert.equalInt(nA.desiredReplicas("web"), 2);           // unchanged: A did not re-reconcile
+
+    connA.close();
+    connB.close();
+    bytes.write_i32(donePtr, 0, 1);
+}
+
+@test
+fn test_async_lease_reconcile_live_e2e(): void {
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4);
+    bytes.write_i32(done, 0, 0);
+
+    coroStart(runLive(done));
+
+    let guard = 0;
+    while (bytes.read_i32(done, 0) < 1 && guard < 20000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(bytes.read_i32(done, 0) as int, 1);
+    poller.setCurrent(0);
+    bytes.free(done);
+    r.destroy();
+}

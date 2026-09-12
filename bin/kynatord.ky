@@ -1,0 +1,155 @@
+// kynatord -- the CONTROL-plane binary of the split orchestrator stack.
+//
+// The node agent (nativelet): it owns DESIRED STATE, not traffic. It watches a directory of declarative
+// YAML workload manifests (legacy JSON specs still parse) and reconciles desired vs actual -- spawning
+// replicas, launching each handoff workload's gateway, restarting on crash per
+// policy, running health probes -- on a fixed loop. It has no listen port and forwards no requests; the
+// data plane (service) does that. The two coordinate ONLY through a service-discovery file.
+//
+//   kynatord [config.json]         # default: kynatord.json ; or set ORCHD_CONFIG
+import orch.nativelet;
+import orch.health;
+import orch.alerts;
+import orch.asynclease;
+import store.httpconfig;
+import net.aio;
+import net.poller;
+import cfg.config;
+import io.file;
+import string;
+import datetime;
+
+// O5: build a standalone self-health report each tick, render Prometheus text + orch_alert series to the
+// metrics file (for a node_exporter textfile collector), and log any CRITICAL alerts. Sync (no await), so
+// it runs atomically between the reconcile loop's cooperative yields. Runs as a sibling coroutine to the
+// reconcile loop so nativelet.run stays the single owner of reconciliation.
+fn publishMetrics(n: nativelet.Nativelet, metricsFile: string, t: alerts.AlertThresholds): void {
+    let rep = health.standaloneReport(n);
+    let statuses = n.status();
+    let al = alerts.evaluate(rep, statuses, t);
+    let text = health.renderMetrics(rep, statuses) + alerts.renderAlertMetrics(al);
+    file.File.writeText(metricsFile, text);
+    if (alerts.criticalCount(al) > 0) { console.log(alerts.renderAlertLines(al)); }
+}
+
+async fn metricsLoop(n: nativelet.Nativelet, metricsFile: string, intervalMs: int, t: alerts.AlertThresholds): int {
+    while (true) {
+        publishMetrics(n, metricsFile, t);
+        let _ = await aio.delay(intervalMs);
+    }
+    return 0;
+}
+
+// Async composition root: spawn the metrics publisher (when enabled) alongside the reconcile loop. spawn
+// is only legal inside an async fn, so main() block-drives this rather than spawning directly.
+async fn runAll(n: nativelet.Nativelet, c: config.OrchConfig): int {
+    if (!string.eql(c.metricsFile, "")) {
+        let t = alerts.AlertThresholds();
+        t.crashLoopRestarts = c.crashLoopRestarts;
+        aio.pinNextCoro(0);   // single writer of the metrics file
+        spawn metricsLoop(n, c.metricsFile, c.reconcileMs, t);
+    }
+    return await nativelet.run(n, c.reconcileMs);
+}
+
+// Wall-clock milliseconds for lease deadlines. nowNs() is the same monotone-ish real clock the store
+// stamps updated_at from; ms keeps the lease TTL arithmetic in the units the lease compares in.
+fn nowMs(): long { return datetime.nowNs() / 1000000; }
+
+// The HA control loop (store-backed). Runs when `store.enabled`: point the HttpConfigStore at artifactd
+// (the config store now lives there -- NovaDB is gone), build the store + lease, then each tick
+// refresh/take leadership and -- ONLY as the valid leader -- reconcile the nativelet from the store's
+// `workloads/` prefix. A standby, a fenced old leader, or a node that has lost the store reconciles
+// nothing (haReconcileTick returns false and, when the store is unreachable, degrades to
+// storeReachable=false). Discovery + probes still run every tick regardless of role so a standby keeps
+// its already-running replicas healthy. Metrics, when enabled, publish the HA health report (role +
+// storeReachable) rather than the standalone one.
+async fn haRun(n: nativelet.Nativelet, c: config.OrchConfig): int {
+    let base = config.storeBaseUrl(c.store);
+    console.log(`kynatord: HA mode, config store at ${base}`);
+    let store = httpconfig.HttpConfigStore(base, c.store.token);
+    let _s = await store.ensureSchema();
+    // TTL is a few reconcile periods so a single slow tick does not drop leadership; floor at 15s.
+    let ttl = (c.reconcileMs * 5) as long;
+    if (ttl < 15000) { ttl = 15000; }
+    let lease = asynclease.AsyncLeaderLease(store, c.nodeId, "leases/kynatord", ttl);
+
+    let metricsOn = !string.eql(c.metricsFile, "");
+    let t = alerts.AlertThresholds();
+    t.crashLoopRestarts = c.crashLoopRestarts;
+
+    while (true) {
+        let _acted = await lease.haReconcileTick(n, "workloads/", nowMs());
+        n.publishDiscovery();
+        let _p = await n.probeAndHeal();
+        if (metricsOn) {
+            let rep = health.haReport(lease, n);
+            let statuses = n.status();
+            let al = alerts.evaluate(rep, statuses, t);
+            let text = health.renderMetrics(rep, statuses) + alerts.renderAlertMetrics(al);
+            file.File.writeText(c.metricsFile, text);
+            if (alerts.criticalCount(al) > 0) { console.log(alerts.renderAlertLines(al)); }
+        }
+        let _sl = await aio.delay(c.reconcileMs);
+    }
+    return 0;
+}
+
+fn main(): int {
+    let path = config.resolveConfigPath("ORCHD_CONFIG", "kynatord.json");
+    let c = config.loadOrchConfig(path);
+
+    let err = config.validateOrch(c);
+    if (!string.eql(err, "")) {
+        console.log(`kynatord: invalid config (${path}): ${err}`);
+        return 1;
+    }
+
+    if (config.hasFlag("--check")) {
+        console.log(`kynatord: config OK (${path}), node=${c.nodeId}, manifests=${c.manifestsDir}`);
+        return 0;
+    }
+
+    let disc = if (string.eql(c.discoveryFile, "")) "off" else c.discoveryFile;
+    let met = if (string.eql(c.metricsFile, "")) "off" else c.metricsFile;
+    let mode = if (c.store.enabled) "ha(store)" else "standalone(manifests)";
+    console.log(`kynatord: node=${c.nodeId} mode=${mode} reconcile=${c.reconcileMs}ms manifests=${c.manifestsDir} discovery=${disc} metrics=${met}`);
+    let n = nativelet.Nativelet(c.manifestsDir);
+    // Publish live service endpoints for service to load-balance across (no-op unless discoveryFile is set).
+    n.discoveryFile = c.discoveryFile;
+    n.advertiseHost = c.advertiseHost;
+    n.servicePath = c.servicePath;   // when set, kynatord launches each handoff workload's service too
+    // Content-addressed artifact delivery: resolve a workload's `artifact: sha256:<hex>` into this local
+    // blob cache, pulling by hash from the artifactd origin (which also hosts the config store) if missing.
+    n.blobRoot = c.artifactCacheDir;
+    // The origin defaults to the config store's URL (all-in-one dev artifactd) but can be pointed at any
+    // HTTP(S) object store (S3/MinIO/CDN) via `artifactOrigin` -- the bring-your-own blob backend. An
+    // https origin gives TLS on the pull for free. See docs/BLOB-STORE.md.
+    n.artifactOrigin = config.artifactOriginUrl(c);
+    n.artifactToken = config.artifactBearer(c);
+
+    // Single reactor on this thread (the control-plane share-nothing model, same as `service`). We create
+    // and DRIVE the reactor here: coroStart schedules the reconcile loop onto it, then the pollComplete
+    // loop pumps it forever. The earlier `holdReactors()` + `let _ = runAll(...)` was wrong: it created the
+    // loop coroutine but never scheduled it onto a reactor, so the daemon stayed alive (held reactors) yet
+    // never reconciled. This mirrors proxy.serveOnReactor.
+    let r = poller.Reactor(1024, 16384, 1024);
+    poller.setCurrent(r.kq);
+    if (c.store.enabled) {
+        // HA: connect to the config store and run the leader-lease-gated store reconcile loop.
+        coroStart(haRun(n, c));
+    } else {
+        // Standalone: reconcile from the local manifests directory (no store, no lease).
+        coroStart(runAll(n, c));
+    }
+    while (true) {
+        let m = r.pollComplete(-1);
+        poller.batchBegin();
+        let i = 0;
+        while (i < m) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,92 @@
+// 193 -- P4 Beta observability close-out: the orchestrator NODE's own self-health surfaces (/healthz,
+// /readyz, /metrics), distinct from the per-workload HTTP probes. HealthReport + renderers are pure data, so
+// every role/health permutation is asserted deterministically here (no live store). The live wiring
+// (buildHealth/timedReconcile reading the lease + a replication-lag read-out) is exercised in the live suite.
+import assert;
+import string;
+import list;
+import store.config;
+import orch.nativelet;
+import orch.health;
+
+// A converged LEADER: store reachable, role leader, nothing under-provisioned -> healthy AND ready.
+@test
+fn test_leader_healthy_and_ready(): void {
+    let r = health.HealthReport("leader", 2, "nodeA", true, 2, 4, 0, 3, 0);
+    assert.equalInt(boolToI(r.healthy()), 1);
+    assert.equalInt(boolToI(r.ready()), 1);
+    assert.equalStr(r.healthzText(), "ok");
+    assert.equalStr(r.readyzText(), "ready");
+}
+
+// A FENCED old leader is still LIVE (serves reads) but NOT ready to take traffic -- fencing is a readiness
+// concern, not liveness.
+@test
+fn test_fenced_live_but_not_ready(): void {
+    let r = health.HealthReport("fenced", 1, "nodeB", true, 2, 0, 2, 5, 0);
+    assert.equalInt(boolToI(r.healthy()), 1);       // process is alive, store reachable
+    assert.equalInt(boolToI(r.ready()), 0);         // fenced -> not ready
+    assert.equalStr(r.readyzText(), "not ready");
+}
+
+// Store unreachable -> degraded liveness AND not ready, regardless of role.
+@test
+fn test_store_down_is_degraded(): void {
+    let r = health.HealthReport("leader", 2, "nodeA", false, 2, 4, 0, 3, 0);
+    assert.equalInt(boolToI(r.healthy()), 0);
+    assert.equalInt(boolToI(r.ready()), 0);
+    assert.equalStr(r.healthzText(), "degraded");
+}
+
+// A valid STANDBY: reachable, role standby -> healthy and ready (ready to serve reads / be promoted).
+@test
+fn test_standby_ready(): void {
+    let r = health.HealthReport("standby", 0, "nodeA", true, 1, 0, 1, 0, 7);
+    assert.equalInt(boolToI(r.ready()), 1);
+}
+
+// Replication lag clamps at 0 and computes leaderLsn - followerSeq otherwise.
+@test
+fn test_repl_lag_math(): void {
+    assert.equalInt(longToI(health.ReplLag(100, 88).frames()), 12);
+    assert.equalInt(longToI(health.ReplLag(100, 100).frames()), 0);
+    assert.equalInt(longToI(health.ReplLag(88, 100).frames()), 0);   // never negative
+}
+
+// The /metrics render: node gauges present with the right values, plus one triple per workload in job order.
+@test
+fn test_metrics_render(): void {
+    let n = nativelet.Nativelet("unused-dir");
+    n.manageProcesses = false;
+    let store = config.ConfigStore();
+    let _1 = store.put("workloads/web", "{\"name\":\"web\",\"binaryPath\":\"/bin/web\",\"replicas\":3}");
+    let _2 = store.put("workloads/api", "{\"name\":\"api\",\"binaryPath\":\"/bin/api\",\"replicas\":1}");
+    n.reconcileFromEntries(store.list("workloads/"), "workloads/");
+
+    let r = health.HealthReport("leader", 2, "nodeA", true, 2, 0, 2, 4, 0);
+    let text = health.renderMetrics(r, n.status());
+
+    assert.equalInt(boolToI(string.contains(text, "orch_up 1\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_ready 1\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_leader_epoch 2\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_under_provisioned 2\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_reconcile_latency_ms 4\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_replication_lag_frames 0\n")), 1);
+    // per-workload lines
+    assert.equalInt(boolToI(string.contains(text, "orch_workload_desired{workload=\"web\"} 3\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_workload_desired{workload=\"api\"} 1\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_workload_running{workload=\"web\"} 0\n")), 1);
+}
+
+// Degraded liveness renders orch_up 0 so a scrape/alert keys off it.
+@test
+fn test_metrics_degraded(): void {
+    let empty = list.List<nativelet.WorkloadStatus>();
+    let r = health.HealthReport("standby", 0, "", false, 0, 0, 0, 0, 0);
+    let text = health.renderMetrics(r, empty);
+    assert.equalInt(boolToI(string.contains(text, "orch_up 0\n")), 1);
+    assert.equalInt(boolToI(string.contains(text, "orch_ready 0\n")), 1);
+}
+
+fn boolToI(b: bool): int { if (b) { return 1; } return 0; }
+fn longToI(v: long): int { return v as int; }

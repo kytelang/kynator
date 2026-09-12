@@ -1,0 +1,158 @@
+// 202 -- LIVE socket forwarding + LIVE health probe through proxyd, on a real reactor (not just Pool.select
+// logic). A real backend TCP server is bound on 127.0.0.1 at an ephemeral port; the proxy's request path
+// (select + forward) opens a real connection to it, sends an HTTP request, and reads the real reply. The
+// probe path connects to the same backend to prove liveness, and reports the port DOWN once the listener is
+// closed. Driven by the same manual reactor loop the language's reactor conformance cases use.
+import assert;
+import bytes;
+import string;
+import os.sys;
+import net.poller;
+import net.eventedio;
+import net.proxy;
+
+const SO_REUSEADDR: int = 4;
+
+// A tiny mutable result holder the coroutine writes and the test reads after the loop (class = reference).
+class Res {
+    pub body: string,
+    pub up: bool,
+    pub down: bool,
+    pub done: int,
+    init() { self.body = ""; self.up = false; self.down = false; self.done = 0; }
+}
+
+// A one-shot HTTP backend: accept one connection, read the request, reply 200 with a fixed body.
+async fn backendServer(listenFd: int, kq: int): void {
+    let s = await eventedio.reactorAccept(listenFd, kq);
+    if (s.isOpen()) {
+        let buf = bytes.alloc(1024);
+        let _ = await s.recvInto(buf, 1024);          // consume the request line/headers
+        bytes.free(buf);
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+        let rb = bytes.alloc(resp.length);
+        let i = 0;
+        while (i < resp.length) { bytes.write_byte(rb, i, resp[i]); i = i + 1; }
+        let _ = await s.sendBuf(rb, resp.length);
+        bytes.free(rb);
+        s.close();
+    }
+}
+
+// The client half: forward one request THROUGH the proxy pool to the backend, and record the reply.
+async fn forwardClient(pool: proxy.Pool, res: Res): void {
+    let req = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let r = await proxy.forwardOnce(pool, req, 2000);
+    res.body = r;
+    res.done = res.done + 1;
+}
+
+// The probe half: a live backend probes UP; a closed port probes DOWN. A live TCP connect proves the port is
+// serving -- this is exactly the health checker's connect probe (probeBackend path=="").
+async fn probeClient(host: string, port: int, res: Res): void {
+    let s = await eventedio.reactorConnect(host, port, poller.currentKq());
+    res.up = s.isOpen();
+    if (s.isOpen()) { s.close(); }
+    res.done = res.done + 1;
+}
+
+// A backend that accepts one connection and holds it briefly, so a probe's connect completes against a real
+// accepting server.
+async fn acceptHold(listenFd: int, kq: int): void {
+    let s = await eventedio.reactorAccept(listenFd, kq);
+    if (s.isOpen()) {
+        let buf = bytes.alloc(16);
+        let _ = await s.recvInto(buf, 16);             // block until the probe closes / sends
+        bytes.free(buf);
+        s.close();
+    }
+}
+
+fn bindListener(): int {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(0, eventedio.parseIPv4("127.0.0.1"));
+    let _ = sys.bind(lfd, sa, 16);
+    bytes.free(sa);
+    sys.listen(lfd, 16);
+    sys.setNonBlocking(lfd);
+    return lfd;
+}
+
+fn drive(r: poller.Reactor, res: Res, want: int): void {
+    let guard = 0;
+    while (res.done < want && guard < 2000) {
+        let nev = r.pollComplete(200);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) { kyte_reactor_resume(r.completedToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+}
+
+// LIVE forwarding: a request travels client -> proxy -> real backend -> back.
+@test
+fn test_live_socket_forwarding(): void {
+    let lfd = bindListener();
+    let port = sys.boundPort(lfd);
+    assert.isTrue(port > 0);
+
+    let pool = proxy.Pool();
+    pool.add("127.0.0.1", port);
+    let r = poller.Reactor(64, 4096, 16);
+    poller.setCurrent(r.kq);
+    let res = Res();
+
+    coroStart(backendServer(lfd, r.kq));
+    coroStart(forwardClient(pool, res));
+    drive(r, res, 1);
+
+    // The proxy actually forwarded and returned the backend's reply.
+    assert.isTrue(string.contains(res.body, "HELLO"));
+    assert.isTrue(string.contains(res.body, "200"));
+
+    r.destroy();
+    sys.close(lfd);
+}
+
+// LIVE probe sweep: a live (accepting) backend probes UP; a port bound-then-closed probes DOWN.
+@test
+fn test_live_probe_up_then_down(): void {
+    // UP: a real listener with an accept loop.
+    let lfd = bindListener();
+    let upPort = sys.boundPort(lfd);
+
+    // DOWN: bind a socket to reserve a port, then CLOSE it so nothing listens there.
+    let cfd = bindListener();
+    let downPort = sys.boundPort(cfd);
+    sys.close(cfd);
+    let poolDown = proxy.Pool();
+    poolDown.add("127.0.0.1", downPort);
+
+    let r = poller.Reactor(64, 4096, 16);
+    poller.setCurrent(r.kq);
+
+    let res = Res();
+    coroStart(acceptHold(lfd, r.kq));                  // keep the UP backend accepting
+    coroStart(probeClient("127.0.0.1", upPort, res));
+    drive(r, res, 1);
+    assert.isTrue(res.up);                             // connect to the live backend succeeded -> UP
+
+    let res2 = Res();
+    coroStart(probeClient("127.0.0.1", downPort, res2));
+    drive(r, res2, 1);
+    assert.isTrue(!res2.up);                           // connect refused (nothing listening) -> DOWN
+
+    // A live probe SWEEP drives the rise/fall hysteresis: `fall` consecutive DOWN probes drain a backend.
+    let dead = poolDown.backends.get(0) ?? proxy.Backend("", 0);
+    assert.equalInt(dead.up, 1);                       // starts in rotation
+    dead.observe(res2.up, 2, 2);                       // probe 1 (down)
+    dead.observe(false, 2, 2);                         // probe 2 (down) -> fall reached
+    assert.equalInt(dead.up, 0);                       // drained out of rotation by the live sweep
+
+    r.destroy();
+    sys.close(lfd);
+}

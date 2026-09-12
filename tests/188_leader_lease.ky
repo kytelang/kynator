@@ -1,0 +1,161 @@
+// 188 -- P3 leader lease + FENCING EPOCH (docs/beta-config-store-design.md). Exactly-one-writer election
+// over the config store's CAS, exercised offline with a mock clock (nowMs passed in). The headline case is
+// the P3 gate: kill the leader, a standby promotes with a bumped epoch, and the OLD leader -- unpaused
+// afterwards -- is FENCED (its stale-epoch renew is rejected), so two nodes can never both act as leader.
+import assert;
+import string;
+import list;
+import store.config;
+import orch.lease;
+import orch.nativelet;
+
+fn specJson(name: string, reps: int): string {
+    return "{\"name\":\"" + name + "\",\"binaryPath\":\"/bin/" + name + "\",\"replicas\":" + reps + "}";
+}
+
+// One shared store, two candidate nodes contending for the same lease key.
+struct Pair {
+    pub store: config.ConfigStore,
+    pub a: lease.LeaderLease,
+    pub b: lease.LeaderLease,
+    init() {
+        self.store = config.ConfigStore();
+        self.a = lease.LeaderLease(self.store, "nodeA", "leases/leader", 1000);
+        self.b = lease.LeaderLease(self.store, "nodeB", "leases/leader", 1000);
+    }
+}
+
+// A free lease is acquired by exactly one node; the other stays standby while it is live.
+@test
+fn test_acquire_and_standby(): void {
+    let p = Pair();
+
+    assert.isTrue(p.a.tryAcquire(0));            // A wins the free lease
+    assert.isTrue(p.a.isLeader);
+    assert.isTrue(p.a.myEpoch == 1);
+    assert.isTrue(p.a.currentEpoch() == 1);
+
+    assert.isFalse(p.b.tryAcquire(100));         // B sees A's live lease -> standby
+    assert.isFalse(p.b.isLeader);
+
+    // A renews and stays leader; B still cannot take it.
+    assert.isTrue(p.a.renew(500));
+    assert.isFalse(p.b.tryAcquire(600));
+    assert.isTrue(p.a.stillLeader(600));
+}
+
+// Two candidates racing for a FREE lease: exactly one wins (CAS create-only).
+@test
+fn test_race_single_winner(): void {
+    let p = Pair();
+    let aw = p.a.tryAcquire(0);
+    let bw = p.b.tryAcquire(0);
+    // exactly one true
+    assert.isTrue((aw && !bw) || (bw && !aw));
+    let leaseRow = p.store.get("leases/leader") ?? config.ConfigEntry("", "", 0);
+    assert.isTrue(leaseRow.revision >= 1);
+}
+
+// THE P3 GATE: leader loss -> standby promotes (epoch bump) -> old leader is FENCED on return.
+@test
+fn test_fencing_after_promotion(): void {
+    let p = Pair();
+
+    // A is leader (epoch 1), renews once (deadline -> 1500).
+    assert.isTrue(p.a.tryAcquire(0));
+    assert.isTrue(p.a.renew(500));
+    assert.isTrue(p.a.myEpoch == 1);
+
+    // A is partitioned/killed: it stops renewing. Time passes beyond its deadline (1500).
+    // B promotes by taking over the EXPIRED lease -> epoch bumps to 2.
+    assert.isTrue(p.b.tryAcquire(2000));
+    assert.isTrue(p.b.isLeader);
+    assert.isTrue(p.b.myEpoch == 2);
+    assert.isTrue(p.b.currentEpoch() == 2);
+
+    // A "unpauses" and tries to carry on as leader with its STALE epoch 1 -> FENCED.
+    assert.isFalse(p.a.renew(2100));             // rejected: the lease is now B's at epoch 2
+    assert.isFalse(p.a.isLeader);                // A stepped down
+    assert.isFalse(p.a.stillLeader(2100));
+
+    // A cannot reacquire while B's lease is live, and can never "win back" epoch 2.
+    assert.isFalse(p.a.tryAcquire(2200));
+    assert.isFalse(p.a.isLeader);
+
+    // B is the sole leader and can keep renewing.
+    assert.isTrue(p.b.renew(2300));
+    assert.isTrue(p.b.stillLeader(2300));
+}
+
+// P8 CHAOS -- CLOCK SKEW: fencing SAFETY must not depend on synchronized clocks. An old leader whose clock
+// is wildly wrong (so by ITS reckoning the lease is nowhere near expired) is STILL fenced the instant a new
+// leader has bumped the epoch, because renew rejects on epoch mismatch, not on time. Time is only used for
+// liveness (when a standby MAY take an abandoned lease); the epoch is what guarantees a single writer.
+@test
+fn test_clock_skew_does_not_break_fencing(): void {
+    let p = Pair();
+
+    // A leads at epoch 1; B promotes to epoch 2 after the lease lapses (normal-clock takeover).
+    assert.isTrue(p.a.tryAcquire(0));
+    assert.isTrue(p.a.myEpoch == 1);
+    assert.isTrue(p.b.tryAcquire(5000));
+    assert.isTrue(p.b.myEpoch == 2);
+
+    // A returns with a HUGELY SKEWED-BEHIND clock: nowMs far in the past, so by A's own clock its old lease
+    // (deadline 1000) is nowhere near expired -- a clock-only guard would let A keep acting. It is STILL
+    // fenced, because renew rejects on epoch mismatch (1 != the store's 2), not on time. This is the safety
+    // property under clock skew: two nodes can never both hold the same epoch, whatever their clocks say.
+    assert.isFalse(p.a.renew(-1000000000));
+    assert.isFalse(p.a.isLeader);
+    assert.isFalse(p.a.stillLeader(-1000000000));
+
+    // B remains the sole leader at its own epoch (within its live deadline 6000). NOTE: if A's lease later
+    // lapses for real, A may re-elect -- but only at a NEW, HIGHER epoch (>=3), so its stale epoch-1 identity
+    // stays fenced forever; that is failover, not split-brain.
+    assert.isTrue(p.b.stillLeader(5500));
+    assert.isTrue(p.b.renew(5500));
+}
+
+// A leader that simply lets its lease expire (no rival) can reacquire, and the epoch still advances
+// monotonically (every acquisition is a new fencing generation).
+@test
+fn test_epoch_monotonic_on_reacquire(): void {
+    let p = Pair();
+    assert.isTrue(p.a.tryAcquire(0));
+    assert.isTrue(p.a.myEpoch == 1);
+
+    // lease lapses (now past deadline); same node reacquires -> epoch 2.
+    assert.isTrue(p.a.tryAcquire(2000));
+    assert.isTrue(p.a.myEpoch == 2);
+    assert.isTrue(p.a.currentEpoch() == 2);
+}
+
+// P3 leader-gated reconcile: only the leader drives workloads; a standby stays read-only until promoted,
+// and a fenced old leader STOPS driving. Two nativelets (one per node) prove the fleet is driven by
+// exactly one node at a time.
+@test
+fn test_leader_gated_reconcile(): void {
+    let p = Pair();
+    let na = nativelet.Nativelet("unused");   na.manageProcesses = false;
+    let nb = nativelet.Nativelet("unused");   nb.manageProcesses = false;
+
+    let desired = list.List<config.ConfigEntry>();
+    desired.push(config.ConfigEntry("workloads/web", specJson("web", 2), 1));
+
+    // Tick both nodes at t=0. A grabs the free lease and reconciles; B is standby and does NOT.
+    let aLed = p.a.haReconcileTick(na, desired, "workloads/", 0);
+    let bLed = p.b.haReconcileTick(nb, desired, "workloads/", 0);
+    assert.isTrue(aLed);
+    assert.isFalse(bLed);
+    assert.equalInt(na.jobs.size(), 1);       // leader drove the workload
+    assert.equalInt(nb.jobs.size(), 0);       // standby stayed read-only
+
+    // A partitioned. At t=2000 (past A's lease) B ticks -> promotes and reconciles; A ticks -> FENCED,
+    // does not reconcile (and if it had running jobs it would stop driving them).
+    let bLed2 = p.b.haReconcileTick(nb, desired, "workloads/", 2000);
+    let aLed2 = p.a.haReconcileTick(na, desired, "workloads/", 2100);
+    assert.isTrue(bLed2);                      // B is the new leader (epoch 2)
+    assert.isFalse(aLed2);                     // old leader fenced -> read-only
+    assert.isTrue(p.b.myEpoch == 2);
+    assert.equalInt(nb.jobs.size(), 1);        // B now drives the fleet
+}

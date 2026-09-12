@@ -1,0 +1,159 @@
+// store/httpconfig.ky -- the config store reached over HTTP, hosted by artifactd (artifacts/cfgstore.ky).
+//
+// This is the drop-in replacement for the NovaDB-backed SqlConfigStore: SAME method surface and SAME
+// etcd-shaped semantics (monotonic revision, per-key mod-revision, prefix list, CAS on revision, delete,
+// watch-since, a fencing write-epoch), so orch/asynclease.ky and kynatord wire against it unchanged. The
+// difference is only the transport -- a request to artifactd's /cfg/* routes instead of SQL over the database
+// interface -- which is why removing NovaDB touched no lease logic.
+//
+// The methods are `async` to match the awaited surface the lease uses, but the round-trip itself is the
+// stdlib's synchronous HTTP client (web.client.Http). That is deliberate and appropriate here: this is a
+// CONTROL-plane client that ticks at the reconcile cadence (~1s) against a co-located artifactd, not a
+// data-plane hot path, so a brief blocking localhost round-trip per tick is fine and avoids standing up a
+// second, async HTTP client. `reachable` mirrors SqlConfigStore: cleared when a round-trip cannot reach
+// the store (connection failure / 5xx), so the lease degrades (steps down, /readyz not-ready) instead of
+// mistaking a dead store for an empty one.
+
+import web.client;
+import web.response;
+import web.status;
+import map;
+import string;
+import list;
+import datetime;
+import store.config;
+import store.wire;
+
+// A store round-trip that could not reach artifactd (transport failure or a 5xx). The lease/health read
+// this via the store's `reachable` flag to tell "store unreachable" from "no such key".
+pub fn isUnreachableCode(code: int): bool { return code >= 500; }
+
+pub struct HttpConfigStore {
+    base: string,          // e.g. "http://127.0.0.1:8135"
+    token: string,         // deploy token (Bearer); "" = none
+    pub reachable: bool,
+    myEpoch: long,         // fencing epoch stamped on put()s once setWriteEpoch() has run
+
+    init(base: string, token: string) {
+        self.base = base;
+        self.token = token;
+        self.reachable = true;
+        self.myEpoch = 0;
+    }
+
+    // ---- transport ----
+    fn headers(self: HttpConfigStore): Map<string, string> {
+        let h = client.Http.emptyHeaders();
+        if (!string.eql(self.token, "")) { h.set("Authorization", "Bearer " + self.token); }
+        return h;
+    }
+
+    // Issue a request and update reachability from the outcome. A 5xx or a synthetic client failure
+    // marks the store unreachable; any real status (200/404/409/412...) means we reached it.
+    fn call(self: HttpConfigStore, method: string, path: string, h: Map<string, string>, body: string): Response {
+        let r = client.Http.request(method, self.base + path, h, body);
+        self.reachable = !isUnreachableCode(r.status.toCode());
+        return r;
+    }
+
+    // A cheap reachability probe (also refreshes `reachable`).
+    pub async fn ping(self: HttpConfigStore): bool {
+        let _ = self.call("GET", "/cfg/ping", self.headers(), "");
+        return self.reachable;
+    }
+
+    // The artifactd store self-initialises (and reloads its snapshot on start), so there is no schema to
+    // create -- kept for surface-compatibility with the old SQL path (kynatord awaits it once at startup).
+    pub async fn ensureSchema(self: HttpConfigStore): void {
+        let _ = await self.ping();
+    }
+
+    // Raise the store's fencing write-epoch and remember it locally so subsequent put()s are stamped with
+    // it. The lease calls this on promotion; the CAS that wins the lease is itself unfenced (it ESTABLISHES
+    // the epoch), so only later spec writes carry the stamp.
+    pub async fn setWriteEpoch(self: HttpConfigStore, epoch: long): void {
+        self.myEpoch = epoch;
+        let _ = self.call("POST", "/cfg/epoch", self.headers(), `${epoch}`);
+    }
+
+    // Durability is always on at artifactd (every mutation is snapshotted), so this is a no-op kept for
+    // surface-compatibility with the SQL path's replication toggle.
+    pub async fn setDurable(self: HttpConfigStore, on: bool): void { }
+
+    pub async fn revision(self: HttpConfigStore): long {
+        let r = self.call("GET", "/cfg/rev", self.headers(), "");
+        if (r.status.toCode() != 200) { return 0 as long; }
+        return string.parseLong(r.body) ?? (0 as long);
+    }
+
+    pub async fn put(self: HttpConfigStore, key: string, value: string): long {
+        return await self.putBy(key, value, "system");
+    }
+
+    pub async fn putBy(self: HttpConfigStore, key: string, value: string, by: string): long {
+        let h = self.headers();
+        h.set("x-cfg-key", key);
+        h.set("x-cfg-by", by);
+        h.set("x-cfg-at", `${datetime.now()}`);
+        h.set("x-cfg-epoch", `${self.myEpoch}`);
+        let r = self.call("POST", "/cfg/put", h, value);
+        if (r.status.toCode() != 200) { return -1 as long; }   // fenced (412) or unreachable
+        return string.parseLong(r.body) ?? (-1 as long);
+    }
+
+    pub async fn get(self: HttpConfigStore, key: string): config.ConfigEntry | undefined {
+        let h = self.headers();
+        h.set("x-cfg-key", key);
+        let r = self.call("GET", "/cfg/get", h, "");
+        if (r.status.toCode() != 200) { return undefined; }
+        let entries = wire.decodeEntries(r.body);
+        if (entries.size() == 0) { return undefined; }
+        return entries.get(0);
+    }
+
+    pub async fn exists(self: HttpConfigStore, key: string): bool {
+        let h = self.headers();
+        h.set("x-cfg-key", key);
+        let r = self.call("GET", "/cfg/exists", h, "");
+        return r.status.toCode() == 200;
+    }
+
+    pub async fn list(self: HttpConfigStore, prefix: string): list.List<config.ConfigEntry> {
+        let h = self.headers();
+        h.set("x-cfg-prefix", prefix);
+        let r = self.call("GET", "/cfg/list", h, "");
+        if (r.status.toCode() != 200) { return list.List<config.ConfigEntry>(); }
+        return wire.decodeEntries(r.body);
+    }
+
+    pub async fn cas(self: HttpConfigStore, key: string, value: string, expectedRevision: long): long {
+        return await self.casBy(key, value, expectedRevision, "system");
+    }
+
+    pub async fn casBy(self: HttpConfigStore, key: string, value: string, expectedRevision: long, by: string): long {
+        let h = self.headers();
+        h.set("x-cfg-key", key);
+        h.set("x-cfg-exp", `${expectedRevision}`);
+        h.set("x-cfg-by", by);
+        h.set("x-cfg-at", `${datetime.now()}`);
+        let r = self.call("POST", "/cfg/cas", h, value);
+        if (r.status.toCode() != 200) { return -1 as long; }
+        return string.parseLong(r.body) ?? (-1 as long);
+    }
+
+    pub async fn del(self: HttpConfigStore, key: string): bool {
+        let h = self.headers();
+        h.set("x-cfg-key", key);
+        let r = self.call("POST", "/cfg/del", h, "");
+        return r.status.toCode() == 200 && string.eql(r.body, "true");
+    }
+
+    pub async fn watch(self: HttpConfigStore, prefix: string, sinceRevision: long): list.List<config.ConfigEvent> {
+        let h = self.headers();
+        h.set("x-cfg-prefix", prefix);
+        h.set("x-cfg-since", `${sinceRevision}`);
+        let r = self.call("GET", "/cfg/watch", h, "");
+        if (r.status.toCode() != 200) { return list.List<config.ConfigEvent>(); }
+        return wire.decodeEvents(r.body);
+    }
+}

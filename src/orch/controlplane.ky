@@ -1,0 +1,167 @@
+// orch/controlplane.ky - the control-plane model behind the web dashboard: a registry of deployed app
+// manifests plus the read model (per-app status) and the JSON / HTML renderers the web surface serves.
+//
+// This is the logic layer, kept sync + in-memory so it is fully testable without a live server or DB.
+// The registry is a Map<name, raw-YAML>; deploy validates a manifest before storing it. A NovaDB-backed
+// registry (persisting to the SqlConfigStore) is a drop-in swap behind the same shape later - the web
+// handlers only ever call deploy / names / status / appsJson / dashboardHtml.
+import map;
+import list;
+import string;
+import orch.manifest;
+
+// The read model for one app - the summary the dashboard shows and the API returns. @serializable so it
+// renders to JSON via the compiler-generated AppStatus__toJson (dogfooding serde).
+@serializable
+pub struct AppStatus {
+    pub name: string,
+    pub minReplicas: int,
+    pub maxReplicas: int,
+    pub autoscale: bool,
+    pub metric: string,
+    pub lb: string,
+    pub isolation: string,   // handoff | netns | loopback | public (platform-selected)
+    pub routes: int,
+    init() {
+        self.name = "";
+        self.minReplicas = 1;
+        self.maxReplicas = 1;
+        self.autoscale = false;
+        self.metric = "";
+        self.lb = "";
+        self.isolation = "";
+        self.routes = 0;
+    }
+}
+
+pub struct Registry {
+    pub apps: map.Map<string, string>,   // app name -> the raw YAML manifest it was deployed from
+    init() { self.apps = map.Map<string, string>(16, string.hash); }
+
+    // Validate a manifest and store it under its name. Returns "" on success, else the validation error
+    // (so the API can answer 400 with the reason). An existing app of the same name is replaced (update).
+    pub fn deploy(self: Registry, yaml: string): string {
+        let m = manifest.parseManifest(yaml);
+        let err = manifest.validateManifest(m);
+        if (!string.eql(err, "")) { return err; }
+        self.apps.set(m.metadata.name, yaml);
+        return "";
+    }
+
+    pub fn names(self: Registry): list.List<string> { return self.apps.keys(); }
+    pub fn has(self: Registry, name: string): bool { return self.apps.has(name); }
+    pub fn count(self: Registry): int { return self.apps.size(); }
+    pub fn manifestYaml(self: Registry, name: string): string { return self.apps.get(name) ?? ""; }
+    pub fn get(self: Registry, name: string): manifest.Manifest { return manifest.parseManifest(self.manifestYaml(name)); }
+
+    // The status read model for one app (parsed + summarised from its stored manifest).
+    pub fn status(self: Registry, name: string): AppStatus {
+        return statusFromManifest(self.get(name));
+    }
+
+    pub fn statuses(self: Registry): list.List<AppStatus> {
+        let out = list.List<AppStatus>();
+        let ns = self.names();
+        let i = 0;
+        while (i < ns.size()) { out.push(self.status(ns.get(i) ?? "")); i = i + 1; }
+        return out;
+    }
+}
+
+// The status read model for one manifest -- the summary shared by the in-memory Registry above and the
+// store-backed control plane (a future UI or the CLI), which reads raw manifest YAML straight out of the config
+// store. Kept free of any store/web coupling so both paths render an identical row.
+pub fn statusFromManifest(m: manifest.Manifest): AppStatus {
+    let s = AppStatus();
+    s.name = m.metadata.name;
+    s.minReplicas = m.replicas.min;
+    s.maxReplicas = m.replicas.max;
+    s.autoscale = m.autoscale.enabled;
+    s.metric = m.autoscale.metric;
+    s.lb = m.lb.strategy;
+    s.isolation = manifest.isolationMode(m);
+    s.routes = m.routes.size();
+    return s;
+}
+
+// The status read model parsed straight from a manifest YAML string (what a control-plane UI stores per app).
+pub fn statusOf(yaml: string): AppStatus {
+    return statusFromManifest(manifest.parseManifest(yaml));
+}
+
+// JSON array of every app's status (GET /api/apps). Uses the serde-generated writer per element.
+pub fn appsJson(reg: Registry): string {
+    let ss = reg.statuses();
+    let out = "[";
+    let i = 0;
+    while (i < ss.size()) {
+        if (i > 0) { out = out + ","; }
+        out = out + AppStatus__toJson(ss.get(i) ?? AppStatus());
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+// JSON for one app's status, or {"error":"not found"} (GET /api/apps/{name}).
+pub fn appJson(reg: Registry, name: string): string {
+    if (!reg.has(name)) { return `{"error":"not found: ${name}"}`; }
+    return AppStatus__toJson(reg.status(name));
+}
+
+// HTML-escape a text value before it goes into a `<td>`: an app name (or metric/lb/isolation string) that
+// contains `<`, `>`, `&`, `"`, or `'` must not be able to inject markup into the dashboard table.
+fn htmlEscape(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < string.len(s)) {
+        let c = s[i];
+        if (c == 38) { out = out + "&amp;"; }        // &
+        else if (c == 60) { out = out + "&lt;"; }    // <
+        else if (c == 62) { out = out + "&gt;"; }    // >
+        else if (c == 34) { out = out + "&quot;"; }  // "
+        else if (c == 39) { out = out + "&#39;"; }   // '
+        else { out = out + string.charAt(s, i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cell(v: string): string { return `<td>${htmlEscape(v)}</td>`; }
+
+fn appsTable(ss: list.List<AppStatus>): string {
+    let rows = "";
+    let i = 0;
+    while (i < ss.size()) {
+        let s = ss.get(i) ?? AppStatus();
+        let band = `${s.minReplicas}-${s.maxReplicas}`;
+        let auto = if (s.autoscale) `on (${s.metric})` else "off";
+        rows = rows + "<tr>" + cell(s.name) + cell(band) + cell(auto) + cell(s.lb)
+             + cell(s.isolation) + cell(`${s.routes}`) + "</tr>";
+        i = i + 1;
+    }
+    return "<table><tr><th>App</th><th>Replicas</th><th>Autoscale</th><th>LB</th><th>Isolation</th>"
+         + "<th>Routes</th></tr>" + rows + "</table>";
+}
+
+// The #apps fragment for a list of statuses (single line, no newlines) a Datastar patch-elements event
+// replaces the table with. Split from appsFragment so a store-backed control-plane UI, which
+// reads statuses out of the config store rather than the in-memory Registry, renders the identical block.
+pub fn appsFragmentFrom(ss: list.List<AppStatus>): string {
+    return `<div id="apps"><p>${ss.size()} app(s) deployed.</p>` + appsTable(ss) + "</div>";
+}
+
+// The #apps fragment (single line, no newlines) a Datastar patch-elements event replaces the table with.
+pub fn appsFragment(reg: Registry): string {
+    return appsFragmentFrom(reg.statuses());
+}
+
+// A minimal self-contained HTML dashboard (GET /). One row per app, showing the read model.
+pub fn dashboardHtml(reg: Registry): string {
+    let ss = reg.statuses();
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Kyte control plane</title>"
+         + "<style>body{font-family:system-ui,sans-serif;margin:2rem}table{border-collapse:collapse}"
+         + "th,td{border:1px solid #ccc;padding:.4rem .8rem;text-align:left}th{background:#f4f4f4}</style>"
+         + "</head><body>"
+         + `<h1>Kyte control plane</h1><p>${ss.size()} app(s) deployed.</p>`
+         + appsTable(ss) + "</body></html>";
+}

@@ -1,0 +1,177 @@
+// artifacts/service.ky -- the artifact daemon's HTTP surface.
+//
+// Two layers, one guard. Everything is behind a deploy-token check because this endpoint accepts a binary
+// that kynatord WILL execute -- the highest-privilege surface in the stack.
+//
+// CONTENT layer (sha-addressed blobs -- CI pushes bytes here first):
+//   GET  /artifacts/{sha}/exists   -> 200 present / 404 absent        (CI skips re-uploading an unchanged blob)
+//   PUT  /artifacts/{sha}          -> 201 stored / 200 exists / 409 body != {sha} / 413 too large
+//   GET  /artifacts/{sha}          -> 200 octet-stream / 404          (verified on read)
+//
+// NAMESPACE layer (app/version -> digest -- CI names the bytes after uploading them):
+//   PUT  /apps/{app}/{version}     -> 201 bound / 200 same / 404 blob missing / 409 immutable / 400 bad name
+//                                     (body = "sha256:<hex>", the digest to bind)
+//   GET  /apps/{app}/{version}     -> 200 octet-stream / 404          (resolve tag -> verified blob)
+//   GET  /apps/{app}/{version}/digest -> 200 "sha256:<hex>" / 404
+//   GET  /apps/{app}               -> 200 version listing (+ "current: <v>") / 404 unknown app
+//   POST /apps/{app}/promote       -> 200 promoted / 404 no such version   (body = version to make current)
+import web.app;
+import web.routing;
+import web.response;
+import web.status;
+import string;
+import list;
+import artifacts.blobstore;
+import artifacts.registry;
+
+// Reject any single upload larger than this (the store holds the whole blob in memory, so an unbounded
+// body is a trivial OOM). 512 MiB is generous for a native binary; raise it only alongside streaming I/O.
+fn maxUploadBytes(): long { return 536870912; }
+
+// One response builder for the whole file (keeps the Status enum reference in a single place).
+fn resp(code: int, body: string): Response {
+    return response.Response(Status.fromCode(code), body);
+}
+
+// Constant-time string equality: compares EVERY byte (never early-exits on the first mismatch) so the
+// time taken does not leak how much of a guessed token was correct. Used for the deploy-token check.
+fn ctEqual(a: string, b: string): bool {
+    if (string.len(a) != string.len(b)) { return false; }
+    let diff = 0;
+    let i = 0;
+    let n = string.len(a);
+    while (i < n) {
+        diff = diff | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+// Bearer-token guard. Empty token = auth disabled (local dev only); never ship that.
+pub struct DeployAuth impl RouteMiddleware {
+    token: string,
+    init(token: string) { self.token = token; }
+    async fn handle(self: DeployAuth, ctx: routing.Context, next: routing.Chain): Response {
+        if (string.eql(self.token, "")) { return await next.proceed(ctx); }
+        let got = ctx.request.getHeader("authorization") ?? "";
+        if (!ctEqual(got, "Bearer " + self.token)) { return resp(401, "missing or invalid deploy token"); }
+        return await next.proceed(ctx);
+    }
+}
+
+// ---- content layer --------------------------------------------------------------------------------
+
+pub struct BlobExists impl RouteHandler {
+    store: blobstore.BlobStore,
+    init(store: blobstore.BlobStore) { self.store = store; }
+    async fn serve(self: BlobExists, ctx: routing.Context): Response {
+        if (self.store.has(ctx.param("sha"))) { return resp(200, ""); }
+        return resp(404, "");
+    }
+}
+
+pub struct BlobPut impl RouteHandler {
+    store: blobstore.BlobStore,
+    init(store: blobstore.BlobStore) { self.store = store; }
+    async fn serve(self: BlobPut, ctx: routing.Context): Response {
+        let sha = ctx.param("sha");
+        if (!self.store.validSha(sha)) { return resp(400, "malformed sha"); }
+        let body = ctx.request.body;
+        if ((body.length as long) > maxUploadBytes()) { return resp(413, "artifact exceeds size limit"); }
+        if (self.store.has(sha)) { return resp(200, "exists"); }
+        // put re-verifies the raw (binary-safe) body hashes to {sha} before it is ever published.
+        if (!self.store.put(sha, body)) { return resp(409, "content does not match sha"); }
+        return resp(201, "stored");
+    }
+}
+
+pub struct BlobGet impl RouteHandler {
+    store: blobstore.BlobStore,
+    init(store: blobstore.BlobStore) { self.store = store; }
+    async fn serve(self: BlobGet, ctx: routing.Context): Response {
+        let data = self.store.get(ctx.param("sha"));
+        if (data == undefined) { return resp(404, "no such artifact"); }
+        return resp(200, data ?? "").setHeader("content-type", "application/octet-stream");
+    }
+}
+
+// ---- namespace layer ------------------------------------------------------------------------------
+
+pub struct RegBind impl RouteHandler {
+    reg: registry.Registry,
+    init(reg: registry.Registry) { self.reg = reg; }
+    async fn serve(self: RegBind, ctx: routing.Context): Response {
+        let reason = self.reg.bind(ctx.param("app"), ctx.param("version"), ctx.request.body);
+        if (string.eql(reason, "")) { return resp(201, "bound"); }
+        if (string.eql(reason, "blob not uploaded")) { return resp(404, reason); }
+        if (string.eql(reason, "version already bound to a different digest")) { return resp(409, reason); }
+        return resp(400, reason);
+    }
+}
+
+pub struct RegGet impl RouteHandler {
+    reg: registry.Registry,
+    init(reg: registry.Registry) { self.reg = reg; }
+    async fn serve(self: RegGet, ctx: routing.Context): Response {
+        let data = self.reg.binary(ctx.param("app"), ctx.param("version"));
+        if (data == undefined) { return resp(404, "no such app/version"); }
+        return resp(200, data ?? "").setHeader("content-type", "application/octet-stream");
+    }
+}
+
+pub struct RegDigest impl RouteHandler {
+    reg: registry.Registry,
+    init(reg: registry.Registry) { self.reg = reg; }
+    async fn serve(self: RegDigest, ctx: routing.Context): Response {
+        let ref = self.reg.resolve(ctx.param("app"), ctx.param("version"));
+        if (ref == undefined) { return resp(404, "no such app/version"); }
+        return resp(200, ref ?? "");
+    }
+}
+
+pub struct RegVersions impl RouteHandler {
+    reg: registry.Registry,
+    init(reg: registry.Registry) { self.reg = reg; }
+    async fn serve(self: RegVersions, ctx: routing.Context): Response {
+        let app = ctx.param("app");
+        let vs = self.reg.versions(app);
+        if (vs.size() == 0 && self.reg.current(app) == undefined) { return resp(404, "no such app"); }
+        let body = "";
+        let i = 0;
+        while (i < vs.size()) {
+            body = body + (vs.get(i) ?? "") + "\n";
+            i = i + 1;
+        }
+        let cur = self.reg.current(app);
+        if (cur != undefined) { body = body + "current: " + (cur ?? "") + "\n"; }
+        return resp(200, body);
+    }
+}
+
+pub struct RegPromote impl RouteHandler {
+    reg: registry.Registry,
+    init(reg: registry.Registry) { self.reg = reg; }
+    async fn serve(self: RegPromote, ctx: routing.Context): Response {
+        let reason = self.reg.promote(ctx.param("app"), ctx.request.body);
+        if (string.eql(reason, "")) { return resp(200, "promoted"); }
+        if (string.eql(reason, "no such version")) { return resp(404, reason); }
+        return resp(400, reason);
+    }
+}
+
+// Compose the service: the token guard wraps every route.
+pub fn buildArtifactService(store: blobstore.BlobStore, reg: registry.Registry, token: string): App {
+    let app = App();
+    app.use(DeployAuth(token));
+    // content layer
+    app.get("/artifacts/{sha}/exists", BlobExists(store));
+    app.put("/artifacts/{sha}", BlobPut(store));
+    app.get("/artifacts/{sha}", BlobGet(store));
+    // namespace layer
+    app.put("/apps/{app}/{version}", RegBind(reg));
+    app.get("/apps/{app}/{version}/digest", RegDigest(reg));
+    app.get("/apps/{app}/{version}", RegGet(reg));
+    app.get("/apps/{app}", RegVersions(reg));
+    app.post("/apps/{app}/promote", RegPromote(reg));
+    return app;
+}

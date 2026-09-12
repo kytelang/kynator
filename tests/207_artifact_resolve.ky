@@ -1,0 +1,65 @@
+// 207 -- content-addressed artifact resolution (ROADMAP-1.0 Tier 1 item 2). Offline: seed a blob into a
+// per-node cache with its real sha256, then check the resolver returns the cached local path, that a
+// missing blob with no origin degrades to "", and that the nativelet reconcile hook rewrites a spec's
+// binaryPath to the cached blob before a workload would be spawned.
+import assert;
+import orch.artifact;
+import orch.nativelet;
+import artifacts.blobstore;
+import crypto.hash.sha;
+import string;
+
+fn seed(dir: string, payload: string): string {
+    let cache = blobstore.BlobStore(dir);
+    let digest = sha.sha256(payload);        // 64-hex; BlobStore.put verifies the bytes hash to this
+    let ok = cache.put(digest, payload);
+    assert.isTrue(ok);                        // put succeeds only when payload hashes to digest
+    return digest;
+}
+
+@test
+fn resolve_cached_blob_returns_local_path(): void {
+    let dir = "/tmp/kyn207_a";
+    let payload = "#!/bin/sh\necho cached\n";
+    let digest = seed(dir, payload);
+    let cache = blobstore.BlobStore(dir);
+    // artifact set + already cached + empty origin: no pull needed, returns the cached path.
+    let p = artifact.resolveOrPull("sha256:" + digest, "", "single", "", "", "", cache);
+    assert.isTrue(string.eql(p, cache.localPath(digest)));
+}
+
+@test
+fn uncached_with_no_origin_degrades(): void {
+    let dir = "/tmp/kyn207_b";
+    let cache = blobstore.BlobStore(dir);
+    // a valid-shaped sha that is NOT cached, and no origin to pull from -> "" (caller keeps last-good).
+    let sha64 = "0000000000000000000000000000000000000000000000000000000000000001";
+    let p = artifact.resolveOrPull("sha256:" + sha64, "", "single", "", "", "", cache);
+    assert.isTrue(string.eql(p, ""));
+}
+
+@test
+fn no_artifact_returns_binarypath(): void {
+    let cache = blobstore.BlobStore("/tmp/kyn207_c");
+    let p = artifact.resolveOrPull("", "/opt/app", "single", "", "", "", cache);
+    assert.isTrue(string.eql(p, "/opt/app"));   // legacy/local mode: binaryPath used as-is
+}
+
+@test
+fn nativelet_resolves_cached_blob_to_path(): void {
+    let dir = "/tmp/kyn207_d";
+    let payload = "#!/bin/sh\necho reconciled\n";
+    let digest = seed(dir, payload);
+    let n = nativelet.Nativelet("/tmp/kyn207_unused");
+    n.blobRoot = dir;                 // artifact cache configured; no origin (blob pre-seeded)
+    let rp = n.resolveArtifactPath("sha256:" + digest, "", "single", "");
+    assert.isTrue(string.eql(rp, blobstore.BlobStore(dir).localPath(digest)));
+}
+
+@test
+fn nativelet_degrades_when_blob_missing(): void {
+    let n = nativelet.Nativelet("/tmp/kyn207_unused");
+    n.blobRoot = "/tmp/kyn207_e";     // empty cache, no origin
+    let rp = n.resolveArtifactPath("sha256:0000000000000000000000000000000000000000000000000000000000000002", "", "single", "");
+    assert.isTrue(string.eql(rp, ""));   // cannot resolve -> "" (keep last-good)
+}

@@ -1,0 +1,416 @@
+// orch/spec.ky - workload manifest for the I2 native orchestrator (native-k8s MVP).
+//
+// A Spec describes a workload to run as native processes (NOT containers): the binary, its args, a
+// replica count, a restart policy, optional cgroups-v2 resource limits, and an optional HTTP health
+// probe. Parsed from JSON manifests dropped in the watch directory (see orch/nativelet). Mirrors the Zig
+// PoC's spec.zig, plus `replicas` and the HTTP probe fields the PoC lacked.
+
+import serde.json;
+import list;
+import string;
+
+// NOTE: the app's own configuration is NOT part of the Spec. It lives in the manifest's `config:`
+// section and is read by the application itself (via the framework loader web.config) straight from the
+// manifest file -- never injected as environment variables (which collide across co-located apps). The
+// orchestrator only runs the process; it does not carry or inject app config.
+
+pub struct Spec {
+    pub name: string,           // unique workload key
+    pub binaryPath: string,     // native executable to exec (a LOCAL path; resolved from `artifact` when set)
+    // Content-addressed artifact: a "sha256:<hex>" the binary is fetched-by-hash and verified as, instead
+    // of shipping a local path. When set, kynatord pulls it into its blob cache and points binaryPath at the
+    // cached file (see orch/artifact.ky). Empty = legacy mode, binaryPath is used as-is.
+    pub artifact: string,
+    pub args: List<string>,     // argv (excluding the binary itself)
+    pub restartPolicy: string,  // "always" | "on-failure" | "never"
+    pub replicas: int,          // how many copies to keep running (>=1)
+    // cgroups-v2 limits (Linux only; 0 = unset). cpuMax is milli-CPU (500 = 0.5 core).
+    pub cpuMilli: int,
+    pub memMaxBytes: long,
+    pub pidsMax: int,
+    // Optional HTTP readiness/liveness probe (probePort 0 = no probe). An unhealthy probe restarts.
+    pub probePort: int,
+    pub probePath: string,
+    pub probePeriodMs: int,
+    // Heal-loop failure threshold (liveness/restart semantics, like a Kubernetes livenessProbe): a workload
+    // is restarted only after `probeFall` CONSECUTIVE failed heal probes; any single success resets the
+    // streak, so one flaky probe never bounces a healthy replica.
+    pub probeFall: int,
+    // I4 container-grade isolation dial: 0 = none (plain spawn), 1 = "looks like a container"
+    // (PID/mount/UTS/IPC ns + rootfs + drop caps), 3 = hardened (+ user ns / seccomp). Linux-only;
+    // degrades to a plain spawn elsewhere. `rootfs` = the private root to pivot into ("" = host FS).
+    pub isolationLevel: int,
+    pub rootfs: string,
+    // Service exposure (the control-plane / data-plane split). When basePort > 0, replica i listens on
+    // basePort + i and the supervisor passes that port via `portFlag` (e.g. "--port") on spawn; kynatord
+    // then ADVERTISES host:basePort .. host:(basePort+replicas-1) as the workload's service endpoints for
+    // service to load-balance across. basePort == 0 means "not directly exposed" (advertise the single
+    // probePort if any, shared via SO_REUSEPORT).
+    pub basePort: int,
+    pub portFlag: string,
+    // Linux network-namespace + veth isolation (gateway-only apps). When true, each replica runs in its
+    // own netns (see net/netns) behind a veth pair and binds `basePort` on its PRIVATE address (so all
+    // replicas share the same port in disjoint namespaces); the supervisor advertises each replica's
+    // private netns address instead of a host port. `netnsBase` is the first /30 slot on this node
+    // (replica i takes a free slot from there). No-op off Linux - the caller uses fd-handoff instead.
+    pub netns: bool,
+    pub netnsBase: int,
+    // fd-passing handoff (the default data path): each replica is spawned with KYTE_HANDOFF_SOCK set to
+    // `handoffSock`, so it connects to the service's AF_UNIX rendezvous and receives client sockets there
+    // instead of binding a TCP port. Mutually exclusive with netns / a host port (a handoff app has no
+    // listening socket). The service for this workload binds the SAME rendezvous path.
+    pub handoff: bool,
+    pub handoffSock: string,
+    // The front port the workload's SERVICE (gateway) listens on (carried on the app Spec so kynatord can
+    // derive the service Spec from it via serviceSpecFrom). 0 = default 8080.
+    pub servicePort: int,
+    // Pre-rollout schema-migration gate. When migrateArgs is non-empty, kynatord runs the workload's OWN
+    // binary once, with these args (conventionally ["--migrate"]), to SUCCESS before it starts or rolls the
+    // app replicas. A non-zero exit aborts the rollout and keeps the last-good replicas serving. The same
+    // artifact carries its migrations, so the code and its schema never drift. migrateTimeoutMs bounds the
+    // one-shot (0 = wait indefinitely). Empty migrateArgs = no migration step (the common case).
+    pub migrateArgs: List<string>,
+    pub migrateTimeoutMs: int,
+    // --- foreign-workload support (see FOREIGN-WORKLOADS.md) ------------------------------------------
+    // workloadType: "kyte" (default) or "foreign". A foreign workload is any self-contained binary (Go,
+    // Rust, C#-AOT, ...) that knows nothing of Kyte conventions. It never gets the migrate step or a
+    // companion Kyte service gateway, and it is defaulted OFF fd-handoff (which only a Kyte binary speaks).
+    pub workloadType: string,
+    // Extra environment applied to every replica, as "KEY=VALUE" entries (on top of the inherited env).
+    pub env: List<string>,
+    // Working directory the child is spawned in ("" = inherit kynatord's cwd). For a tarball artifact this
+    // is set to the per-workload extraction directory so a relative binaryPath resolves.
+    pub workdir: string,
+    // Environment variable the assigned port is delivered through. Default "KYTE_PORT"; a foreign binary
+    // that reads $PORT sets this to "PORT". Empty disables env port delivery (the binary gets it via portFlag).
+    pub portEnv: string,
+    // Health-probe type at the kynatord heal layer: "http" (default, GET probePath on probePort),
+    // "tcp" (a bare TCP connect to probePort succeeds), or "exec" (run probeCmd; exit 0 = healthy).
+    pub probeType: string,
+    // argv for an "exec" probe (the binary is probeCmd[0]). Empty for http/tcp.
+    pub probeCmd: List<string>,
+    // File-mounted secret handles: each entry is "ENVVAR=/abs/path". These carry only the PATH (never the
+    // value); the supervisor reads each file at spawn and delivers its content as ENVVAR to the child (see
+    // orch/secrets.resolveSecretEnv). So a secret value never lands in this spec, the manifest, or the store.
+    pub secretRefs: List<string>,
+    // Artifact packaging: "single" (default, the artifact blob IS the executable) or "tarball" (the blob
+    // is a .tar extracted into a per-workload directory; binaryPath is then relative to that directory).
+    pub artifactKind: string,
+    // --- autoscaling (see manifest.Autoscale) ---------------------------------------------------------
+    // When `autoscale` is set, kynatord drives the replica count between [autoMin, autoMax] each reconcile
+    // interval to hold `autoMetric` near `autoTarget` (per replica), instead of pinning it at `replicas`.
+    // `autoMetric` is "cpu" (per-replica CPU percent, sampled from the cgroup) or "inflight" (gateway load).
+    // Only the cpu metric is sampled in the standalone daemon today; inflight is gateway-gated (held).
+    pub autoscale: bool,
+    pub autoMetric: string,
+    pub autoTarget: double,
+    pub autoMin: int,
+    pub autoMax: int,
+    init(name: string, binaryPath: string) {
+        self.name = name;
+        self.binaryPath = binaryPath;
+        self.artifact = "";
+        self.args = List<string>();
+        self.restartPolicy = "never";
+        self.replicas = 1;
+        self.cpuMilli = 0;
+        self.memMaxBytes = 0;
+        self.pidsMax = 0;
+        self.probePort = 0;
+        self.probePath = "/healthz";
+        self.probePeriodMs = 2000;
+        self.probeFall = 3;
+        self.isolationLevel = 0;
+        self.rootfs = "";
+        self.basePort = 0;
+        self.portFlag = "";
+        self.netns = false;
+        self.netnsBase = 0;
+        self.handoff = false;
+        self.handoffSock = "";
+        self.servicePort = 0;
+        self.migrateArgs = List<string>();
+        self.migrateTimeoutMs = 0;
+        self.workloadType = "kyte";
+        self.env = List<string>();
+        self.workdir = "";
+        self.portEnv = "KYTE_PORT";
+        self.probeType = "http";
+        self.probeCmd = List<string>();
+        self.secretRefs = List<string>();
+        self.artifactKind = "single";
+        self.autoscale = false;
+        self.autoMetric = "cpu";
+        self.autoTarget = 0.0;
+        self.autoMin = 1;
+        self.autoMax = 1;
+    }
+}
+
+// True when this workload is a foreign (non-Kyte) binary: no migrate step, no companion Kyte service
+// gateway, and defaulted off fd-handoff. Any workloadType other than the literal "kyte" is treated as
+// foreign, so a typo fails safe (foreign = fewer Kyte assumptions), never silently enabling Kyte-only paths.
+pub fn isForeign(s: Spec): bool { return !string.eql(s.workloadType, "kyte"); }
+
+// True when this workload declares a pre-rollout migration step (see Spec.migrateArgs). kynatord runs the
+// step to success before starting or rolling the app; a false result means "no migration, roll directly".
+pub fn hasMigrate(s: Spec): bool { return s.migrateArgs.size() > 0; }
+
+// Parse a JSON manifest into a Spec. Unknown fields are ignored; missing fields take the Spec defaults.
+// Shape:
+//   { "name":"web", "binaryPath":"/opt/app", "args":["--port","8080"], "restartPolicy":"always",
+//     "replicas":3, "cpuMilli":500, "memMaxBytes":268435456, "pidsMax":128,
+//     "probe":{ "port":8080, "path":"/healthz", "periodMs":2000 } }
+pub fn parseSpec(text: string): Spec {
+    let root = json.parse(text);
+    let name = json.asString(json.get(root, "name")) ?? "";
+    let bin = json.asString(json.get(root, "binaryPath")) ?? "";
+    let s = Spec(name, bin);
+    s.artifact = json.asString(json.get(root, "artifact")) ?? "";
+
+    s.restartPolicy = json.asString(json.get(root, "restartPolicy")) ?? "never";
+    let reps = (json.asNumber(json.get(root, "replicas")) ?? 1) as int;
+    s.replicas = if (reps < 1) 1 else reps;
+
+    // args - iterate the array value directly (avoids naming List<JsonValue> across modules)
+    if (json.has(root, "args")) {
+        let av = json.get(root, "args");
+        let n = json.size(av);
+        let i = 0;
+        while (i < n) {
+            s.args.push(json.asString(json.at(av, i)) ?? "");
+            i = i + 1;
+        }
+    }
+
+    s.isolationLevel = (json.asNumber(json.get(root, "isolationLevel")) ?? 0) as int;
+    s.rootfs = json.asString(json.get(root, "rootfs")) ?? "";
+    s.cpuMilli = (json.asNumber(json.get(root, "cpuMilli")) ?? 0) as int;
+    s.memMaxBytes = json.asNumber(json.get(root, "memMaxBytes")) ?? 0;
+    s.pidsMax = (json.asNumber(json.get(root, "pidsMax")) ?? 0) as int;
+
+    if (json.has(root, "probe")) {
+        let pr = json.get(root, "probe");
+        s.probePort = (json.asNumber(json.get(pr, "port")) ?? 0) as int;
+        s.probePath = json.asString(json.get(pr, "path")) ?? "/healthz";
+        s.probePeriodMs = (json.asNumber(json.get(pr, "periodMs")) ?? 2000) as int;
+        s.probeFall = (json.asNumber(json.get(pr, "fall")) ?? 3) as int;
+    }
+
+    // Service exposure: { "service": { "basePort": 9000, "portFlag": "--port" } }
+    if (json.has(root, "service")) {
+        let sv = json.get(root, "service");
+        s.basePort = (json.asNumber(json.get(sv, "basePort")) ?? 0) as int;
+        s.portFlag = json.asString(json.get(sv, "portFlag")) ?? "";
+    }
+    // fd-handoff: { "handoff": { "sock": "/tmp/kyte-web.sock", "servicePort": 8080 } }. When present the
+    // workload's apps run in handoff mode (KYTE_HANDOFF_SOCK) and kynatord launches its service on servicePort.
+    if (json.has(root, "handoff")) {
+        let hf = json.get(root, "handoff");
+        s.handoff = true;
+        s.handoffSock = json.asString(json.get(hf, "sock")) ?? ("/tmp/kyte-" + s.name + ".sock");
+        s.servicePort = (json.asNumber(json.get(hf, "servicePort")) ?? 8080) as int;
+    }
+    // Pre-rollout migrate gate: { "migrate": { "args": ["--migrate"], "timeoutMs": 120000 } }.
+    if (json.has(root, "migrate")) {
+        let mg = json.get(root, "migrate");
+        if (json.has(mg, "args")) {
+            let mv = json.get(mg, "args");
+            let mn = json.size(mv);
+            let mi = 0;
+            while (mi < mn) {
+                s.migrateArgs.push(json.asString(json.at(mv, mi)) ?? "");
+                mi = mi + 1;
+            }
+        }
+        s.migrateTimeoutMs = (json.asNumber(json.get(mg, "timeoutMs")) ?? 0) as int;
+    }
+
+    // --- foreign-workload fields ---------------------------------------------------------------------
+    s.workloadType = json.asString(json.get(root, "workloadType")) ?? "kyte";
+    s.workdir = json.asString(json.get(root, "workdir")) ?? "";
+    s.portEnv = json.asString(json.get(root, "portEnv")) ?? "KYTE_PORT";
+    s.artifactKind = json.asString(json.get(root, "artifactKind")) ?? "single";
+    // env: array of "KEY=VALUE" strings (an object is not used: the json module has no key enumeration).
+    if (json.has(root, "env")) {
+        let ev = json.get(root, "env");
+        let en = json.size(ev);
+        let ei = 0;
+        while (ei < en) {
+            s.env.push(json.asString(json.at(ev, ei)) ?? "");
+            ei = ei + 1;
+        }
+    }
+    // Secret handles (paths only): { "secrets": ["DB_PASSWORD=/run/secrets/db"] }
+    if (json.has(root, "secrets")) {
+        let sv = json.get(root, "secrets");
+        let sn = json.size(sv);
+        let sj = 0;
+        while (sj < sn) {
+            s.secretRefs.push(json.asString(json.at(sv, sj)) ?? "");
+            sj = sj + 1;
+        }
+    }
+    // probe type selector + optional exec command: { "probe": { ..., "type":"exec", "cmd":["/bin/check"] } }
+    if (json.has(root, "probe")) {
+        let pr2 = json.get(root, "probe");
+        s.probeType = json.asString(json.get(pr2, "type")) ?? "http";
+        if (json.has(pr2, "cmd")) {
+            let cv = json.get(pr2, "cmd");
+            let cn = json.size(cv);
+            let ci = 0;
+            while (ci < cn) {
+                s.probeCmd.push(json.asString(json.at(cv, ci)) ?? "");
+                ci = ci + 1;
+            }
+        }
+    }
+    return s;
+}
+
+// Derive the SERVICE (gateway) Spec for a handoff workload `app` - what kynatord runs alongside the app
+// replicas. Same rendezvous the apps use (app.handoffSock), the service binary, one replica, listening on
+// app.servicePort (the supervisor's handoff spawn turns basePort into KYTE_PORT). Name suffixed "-svc".
+pub fn serviceSpecFrom(app: Spec, servicePath: string): Spec {
+    let s = Spec(app.name + "-svc", servicePath);
+    s.replicas = 1;
+    s.restartPolicy = "always";
+    s.handoff = true;
+    s.handoffSock = app.handoffSock;
+    s.basePort = if (app.servicePort > 0) app.servicePort else 8080;
+    return s;
+}
+
+// The service endpoints a workload ADVERTISES on `host`: one per replica at basePort + i when directly
+// exposed (basePort > 0), else the single shared probePort (SO_REUSEPORT) if any, else none. Pure and
+// deterministic (independent of how many replicas are live right now) -- the CONTROL plane advertises the
+// desired topology; the data plane (service) health-checks which of them are actually up. Callers own the list.
+pub fn serviceEndpoints(s: Spec, host: string): List<string> {
+    let out = List<string>();
+    if (s.basePort > 0) {
+        let i = 0;
+        while (i < s.replicas) {
+            let p = s.basePort + i;
+            out.push(`${host}:${p}`);
+            i = i + 1;
+        }
+    } else if (s.probePort > 0) {
+        out.push(`${host}:${s.probePort}`);
+    }
+    return out;
+}
+
+// Validate a PARSED spec before the reconcile loop is allowed to apply it (P4 rollout safety). parseSpec
+// is lenient (missing fields take defaults, replicas is clamped to >=1), so a syntactically valid JSON can
+// still describe a workload that must never be started or, worse, must never REPLACE a healthy one. Returns
+// "" when the spec is safe to apply, else a human-readable reason. The reconcile path treats a non-empty
+// reason exactly like an unreadable manifest: keep the last-good workload running, do not tear it down.
+pub fn validateSpec(s: Spec): string {
+    if (string.eql(s.name, "")) { return "empty name"; }
+    if (string.eql(s.binaryPath, "")) { return "empty binaryPath"; }
+    if (s.replicas < 1) { return "replicas must be >= 1"; }
+    if (!string.eql(s.restartPolicy, "always")
+        && !string.eql(s.restartPolicy, "on-failure")
+        && !string.eql(s.restartPolicy, "never")) {
+        return "unknown restartPolicy '" + s.restartPolicy + "'";
+    }
+    if (s.isolationLevel != 0 && s.isolationLevel != 1 && s.isolationLevel != 3) {
+        return "isolationLevel must be 0, 1, or 3";
+    }
+    if (s.cpuMilli < 0) { return "cpuMilli must be >= 0"; }
+    if (s.memMaxBytes < 0) { return "memMaxBytes must be >= 0"; }
+    if (s.pidsMax < 0) { return "pidsMax must be >= 0"; }
+    if (s.probePort < 0) { return "probePort must be >= 0"; }
+    if (s.probePort > 0 && s.probePeriodMs < 1) { return "probePeriodMs must be >= 1 when a probe is set"; }
+    if (s.migrateTimeoutMs < 0) { return "migrateTimeoutMs must be >= 0"; }
+    if (!string.eql(s.workloadType, "kyte") && !string.eql(s.workloadType, "foreign")) {
+        return "workloadType must be 'kyte' or 'foreign'";
+    }
+    if (!string.eql(s.probeType, "http")
+        && !string.eql(s.probeType, "tcp")
+        && !string.eql(s.probeType, "exec")) {
+        return "probeType must be 'http', 'tcp', or 'exec'";
+    }
+    if (string.eql(s.probeType, "exec") && s.probeCmd.size() < 1) {
+        return "probeType 'exec' requires a non-empty probe cmd";
+    }
+    // Every env entry must be "KEY=VALUE" with a non-empty KEY (the runtime splits on the first '='),
+    // else it is silently dropped by the child - reject it up front so a typo is not swallowed.
+    let ei = 0;
+    while (ei < s.env.size()) {
+        let entry = s.env.get(ei) ?? "";
+        let eq = string.indexOf(entry, "=");
+        if (eq < 1) { return "env entry must be 'KEY=VALUE' with a non-empty key: '" + entry + "'"; }
+        ei = ei + 1;
+    }
+    // A foreign workload cannot speak Kyte fd-handoff. Reject the combination rather than silently
+    // spawning a binary onto a data path it will never read (manifest.toSpec defaults foreign off handoff,
+    // so this only fires if a raw Spec sets both).
+    if (isForeign(s) && s.handoff) { return "foreign workloadType cannot use fd-handoff"; }
+    return "";
+}
+
+// Two specs are "the same workload" (no restart needed) when the run-affecting fields all match. The
+// name is the key, so it's assumed equal. Mirrors the PoC's specsEqual, extended with replicas + probe.
+pub fn specsEqual(a: Spec, b: Spec): bool {
+    if (a.replicas != b.replicas) { return false; }
+    return specsEqualExceptReplicas(a, b);
+}
+
+// Like specsEqual but ignores the replica COUNT. Reconcile uses this to tell a pure scale change (only
+// `replicas` differs) from a real workload change (binary, env, isolation, ...): a scale change is applied
+// by adding/removing replicas in place (ensureReplicas), never by a rolling binary bounce of live replicas.
+pub fn specsEqualExceptReplicas(a: Spec, b: Spec): bool {
+    if (!string.eql(a.binaryPath, b.binaryPath)) { return false; }
+    if (!string.eql(a.restartPolicy, b.restartPolicy)) { return false; }
+    if (a.cpuMilli != b.cpuMilli) { return false; }
+    if (a.memMaxBytes != b.memMaxBytes) { return false; }
+    if (a.pidsMax != b.pidsMax) { return false; }
+    if (a.probePort != b.probePort) { return false; }
+    if (!string.eql(a.probePath, b.probePath)) { return false; }
+    if (a.probeFall != b.probeFall) { return false; }
+    if (a.isolationLevel != b.isolationLevel) { return false; }
+    if (!string.eql(a.rootfs, b.rootfs)) { return false; }
+    if (!string.eql(a.workloadType, b.workloadType)) { return false; }
+    if (!string.eql(a.workdir, b.workdir)) { return false; }
+    if (!string.eql(a.portEnv, b.portEnv)) { return false; }
+    if (!string.eql(a.probeType, b.probeType)) { return false; }
+    if (!string.eql(a.artifactKind, b.artifactKind)) { return false; }
+    if (a.args.size() != b.args.size()) { return false; }
+    let i = 0;
+    while (i < a.args.size()) {
+        if (!string.eql(a.args.get(i) ?? "", b.args.get(i) ?? "")) { return false; }
+        i = i + 1;
+    }
+    if (a.env.size() != b.env.size()) { return false; }
+    let e = 0;
+    while (e < a.env.size()) {
+        if (!string.eql(a.env.get(e) ?? "", b.env.get(e) ?? "")) { return false; }
+        e = e + 1;
+    }
+    if (a.probeCmd.size() != b.probeCmd.size()) { return false; }
+    let c = 0;
+    while (c < a.probeCmd.size()) {
+        if (!string.eql(a.probeCmd.get(c) ?? "", b.probeCmd.get(c) ?? "")) { return false; }
+        c = c + 1;
+    }
+    // Secret HANDLES (paths) only -- comparing these is safe (no value is present). A changed handle rolls.
+    if (a.secretRefs.size() != b.secretRefs.size()) { return false; }
+    let sr = 0;
+    while (sr < a.secretRefs.size()) {
+        if (!string.eql(a.secretRefs.get(sr) ?? "", b.secretRefs.get(sr) ?? "")) { return false; }
+        sr = sr + 1;
+    }
+    return true;
+}
+
+// Restart decision for a replica that just exited with `exitCode` (-1 = spawn/poll error, >=0 = real
+// exit status, 128+sig for a killed child). Pure, so it is directly unit-testable.
+//   always     → always restart
+//   on-failure → restart unless it exited cleanly (code 0)
+//   never      → never restart
+pub fn shouldRestart(policy: string, exitCode: int): bool {
+    if (string.eql(policy, "always")) { return true; }
+    if (string.eql(policy, "on-failure")) { return exitCode != 0; }
+    return false;
+}
